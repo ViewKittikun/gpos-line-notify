@@ -117,10 +117,15 @@ async function main() {
 
     log('เปิดหน้าสต็อก…');
     await page.goto(WEB + '/branch/stock_inventory', { waitUntil: 'networkidle', timeout: 60000 });
-    await page.waitForTimeout(1500);
-    // คลิกแท็บ "แจ้งเตือนสต็อก" เพื่อให้ยิงรายการสต็อกต่ำ
-    await page.getByText(/แจ้งเตือนสต็อก/).first().click().catch(()=>{});
-    await page.waitForTimeout(2500);
+    await page.waitForTimeout(2000);
+    // คลิกแท็บ "แจ้งเตือนสต็อก" เพื่อให้ยิงรายการสต็อกต่ำ + รอ response ของ queryInvSpuListManage
+    try {
+      const waitInv = page.waitForResponse(r => r.url().includes('queryInvSpuListManage'), { timeout: 15000 }).catch(()=>null);
+      await page.getByText(/แจ้งเตือนสต็อก/).first().click({ timeout: 8000 });
+      const r = await waitInv;
+      if (r) { try { captures['queryInvSpuListManage'] = captures['queryInvSpuListManage'] || {}; captures['queryInvSpuListManage'].lowStock = await r.json(); } catch(_){} }
+      await page.waitForTimeout(1500);
+    } catch (e) { log('  (คลิกแท็บแจ้งเตือนสต็อกไม่ได้: ' + e.message + ')'); }
 
     log('เปิดหน้าสรุปยอดขายทั้งหมด…');
     await page.goto(WEB + '/branch/reports_business_overview', { waitUntil: 'networkidle', timeout: 60000 });
@@ -151,18 +156,24 @@ async function main() {
     // ---------- 4) DUMP ข้อมูลดิบให้เห็นโครงสร้างจริง ----------
     const dump = {};
     for (const s of SERVICES) {
+      const c = captures[s] || {};
       dump[s] = {
-        gotRequest:  !!(captures[s] && captures[s].request),
-        gotResponse: !!(captures[s] && captures[s].response),
-        response:      captures[s] && captures[s].response,
-        todayResponse: captures[s] && captures[s].todayResponse
+        gotRequest:  !!c.request,
+        gotResponse: !!c.response,
+        response:      c.response,
+        todayResponse: c.todayResponse,
+        lowStock:      c.lowStock
       };
     }
     fs.writeFileSync('gpos_raw.json', JSON.stringify(dump, null, 2));
-    log('บันทึก gpos_raw.json แล้ว — เปิดดูโครงสร้าง JSON จริงได้เลย');
-    console.log('\n==================== RAW DUMP ====================');
-    console.log(JSON.stringify(dump, null, 2).slice(0, 6000));
-    console.log('================================================\n');
+    // สรุปสั้น ๆ ว่าแต่ละ service ดักได้ไหม (พิมพ์ก่อน JSON ก้อนใหญ่ กันโดนตัด)
+    console.log('\n==================== CAPTURED SUMMARY ====================');
+    for (const s of SERVICES) {
+      const c = captures[s] || {};
+      console.log(`- ${s}: req=${!!c.request} resp=${!!c.response} today=${!!c.todayResponse} lowStock=${!!c.lowStock}`);
+    }
+    console.log('=========================================================\n');
+    log('บันทึก gpos_raw.json แล้ว (ดูโครงสร้างเต็มใน artifact)');
 
     // ---------- 5) ประกอบข้อความ (best-effort) + ส่ง LINE (ถ้าเปิด SEND_LINE) ----------
     const msg = buildMessage(captures, range);
@@ -180,42 +191,50 @@ async function main() {
   }
 }
 
-/** ประกอบข้อความสรุป — best-effort จาก key ที่รู้ ปรับได้เมื่อเห็น JSON จริง */
+/** ประกอบข้อความสรุป — ใช้ field จริงจาก JSON ที่ดักได้ */
 function buildMessage(cap, range) {
   const baht = n => (Number(n || 0) / 1000).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const dateLabel = new Date(range.startTime + TZ_OFFSET_MS).toISOString().slice(0, 10);
   let lines = ['📊 สรุปยอดขาย Nerd Cafe CNX', '📅 ' + dateLabel, ''];
 
-  // ยอดขายรวม + เมนูขายดี จาก querySalesItemReport (todayResponse ก่อน)
+  // ---- ยอดขายรวม + เมนูขายดี จาก querySalesItemReport ----
   const sales = (cap.querySalesItemReport && (cap.querySalesItemReport.todayResponse || cap.querySalesItemReport.response)) || null;
-  const list = sales && sales.data && (sales.data.list || sales.data.records || sales.data.items || (Array.isArray(sales.data) ? sales.data : null));
-  if (Array.isArray(list)) {
-    // เดา field: ชื่อ/จำนวน/ยอด — ปรับให้ตรงเมื่อเห็น JSON จริง
+  const data = sales && sales.data;
+  const list = (data && (data.list || data.salesReportModelList)) || [];
+  if (Array.isArray(list) && list.length) {
     const items = list.map(it => ({
-      name: it.productName || it.itemName || it.name || it.spuName || '-',
-      qty:  Number(it.saleQty || it.quantity || it.qty || it.saleNum || 0),
-      amt:  Number(it.saleAmount || it.amount || it.salesAmount || it.netAmount || 0)
+      name: it.itemTitle || '-',
+      qty:  Number(it.sales || 0),
+      amt:  Number((it.salesPrice && it.salesPrice.amount) || 0)
     }));
-    const total = items.reduce((s, x) => s + x.amt, 0);
+    // ยอดขายรวมของวัน: statisticalData → SALES_AMOUNT (ถ้าไม่มีค่อยรวมเอง)
+    let total = 0;
+    const stat = (data.statisticalData || []).find(s => s.key === 'SALES_AMOUNT');
+    total = (stat && stat.value && stat.value.amount) || items.reduce((s, x) => s + x.amt, 0);
+
     lines.push('💰 ยอดขายรวม: ' + baht(total) + ' บาท');
+    lines.push('🧾 จำนวนรายการสินค้า: ' + (data.total != null ? data.total : items.length));
     lines.push('');
     lines.push('🏆 เมนูขายดี:');
     items.sort((a, b) => b.qty - a.qty).slice(0, 5).forEach((x, i) => {
-      lines.push(`${i + 1}. ${x.name}  x${x.qty}  (${baht(x.amt)}฿)`);
+      lines.push(`${i + 1}. ${x.name}  ×${x.qty}  (${baht(x.amt)}฿)`);
     });
   } else {
-    lines.push('(ยังแมพข้อมูลยอดขายไม่ได้ — ดู gpos_raw.json เพื่อดู key จริง)');
+    lines.push('💰 วันนี้ยังไม่มียอดขาย');
   }
 
-  // สต็อกต่ำ
+  // ---- สต็อกต่ำ ----
   const alert = cap.queryAlertNum && cap.queryAlertNum.response;
   const warn = alert && alert.data && alert.data.metric && alert.data.metric.warnSpuCount;
-  const inv = cap.queryInvSpuListManage && cap.queryInvSpuListManage.response;
-  const invList = inv && inv.data && (inv.data.list || inv.data.records);
+  const invResp = cap.queryInvSpuListManage && (cap.queryInvSpuListManage.lowStock || cap.queryInvSpuListManage.response);
+  const invList = invResp && invResp.data && (invResp.data.list || invResp.data.records);
   lines.push('');
   lines.push('⚠️ สินค้าใกล้หมด: ' + (warn != null ? warn + ' รายการ' : '-'));
-  if (Array.isArray(invList)) {
-    invList.slice(0, 8).forEach(it => lines.push('• ' + (it.productName || it.name || '-')));
+  if (Array.isArray(invList) && invList.length) {
+    invList.slice(0, 10).forEach(it => {
+      const name = it.productName || it.itemTitle || it.name || '-';
+      lines.push('• ' + name);
+    });
   }
 
   return lines.join('\n');
