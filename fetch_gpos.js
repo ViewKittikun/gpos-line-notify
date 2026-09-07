@@ -168,6 +168,11 @@ async function main() {
     await replay('queryBusinessTrendReport', { startTime: range.startTime, endTime: range.endTime, storeId: STORE });
     // สต็อก: กันเหนียว replay ใส่ storeId (เผื่อ natural call ยังไม่มี store context)
     await replay('queryAlertNum', { storeId: STORE });
+    // รายชื่อสินค้าใกล้หมด: replay ใส่ storeId + filter สต็อกต่ำ (ลองหลายชื่อ param)
+    await replay('queryInvSpuListManage', {
+      storeId: STORE, pageNum: 1, pageSize: 30,
+      alertType: 'WARN', warnStatus: 'WARN', stockWarn: true, tabType: 'WARN', inventoryAlertType: 'STOCK_WARN'
+    });
 
     // ---------- 4) DUMP ข้อมูลดิบให้เห็นโครงสร้างจริง ----------
     const dump = {};
@@ -244,15 +249,19 @@ function buildMessage(cap, range) {
   const alertCand = [cap.queryAlertNum && cap.queryAlertNum.response, cap.queryAlertNum && cap.queryAlertNum.todayResponse]
     .find(a => a && a.success && a.data && a.data.metric);
   const warn = alertCand && alertCand.data.metric.warnSpuCount;
-  // รายชื่อสินค้าใกล้หมด: จากแท็บแจ้งเตือนสต็อก (lowStock) หรือ response ที่ success
-  const invCand = [cap.queryInvSpuListManage && cap.queryInvSpuListManage.lowStock, cap.queryInvSpuListManage && cap.queryInvSpuListManage.response]
-    .find(a => a && a.success && a.data && (a.data.list || a.data.records));
-  const invList = invCand && (invCand.data.list || invCand.data.records);
+  // รายชื่อสินค้าใกล้หมด: จากแท็บแจ้งเตือนสต็อก (lowStock) / replay (todayResponse) / response
+  const invCand = [
+    cap.queryInvSpuListManage && cap.queryInvSpuListManage.lowStock,
+    cap.queryInvSpuListManage && cap.queryInvSpuListManage.todayResponse,
+    cap.queryInvSpuListManage && cap.queryInvSpuListManage.response
+  ].find(a => a && a.success && a.data && (a.data.list || a.data.records));
+  let invList = invCand && (invCand.data.list || invCand.data.records);
   lines.push('');
   lines.push('⚠️ สินค้าใกล้หมด: ' + (warn != null ? warn + ' รายการ' : '-'));
-  if (Array.isArray(invList) && invList.length) {
-    invList.slice(0, 10).forEach(it => {
-      const name = it.productName || it.itemTitle || it.name || '-';
+  // แสดงรายชื่อเฉพาะเมื่อ list สั้นพอ (แปลว่ากรองสต็อกต่ำสำเร็จ ไม่ใช่รายการทั้งหมด)
+  if (Array.isArray(invList) && invList.length && invList.length <= 15) {
+    invList.slice(0, 12).forEach(it => {
+      const name = it.productName || it.itemTitle || it.name || it.spuName || '-';
       lines.push('• ' + name);
     });
   }
