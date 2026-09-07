@@ -73,7 +73,9 @@ async function main() {
       try {
         const j = await res.json();
         captures[svc] = captures[svc] || {};
-        captures[svc].response = j;
+        // เก็บอันที่ success ไว้ก่อน อย่าให้อันที่ error (เช่น storeId ว่าง) มาทับ
+        if (j && j.success !== false) captures[svc].response = j;
+        else if (!captures[svc].response) captures[svc].responseErr = j;
       } catch (_) {}
     }
   });
@@ -109,6 +111,18 @@ async function main() {
         throw new Error('login ไม่สำเร็จ (ยังอยู่หน้า login) — ดู login_failed.png และตรวจ GPOS_USER/GPOS_PASS');
       });
     log('login สำเร็จ ✓  url =', page.url());
+
+    // ---------- 1.5) เลือกร้าน (choose_institution) เพื่อให้มี store context ----------
+    for (let attempt = 0; attempt < 3 && page.url().includes('choose_institution'); attempt++) {
+      log('อยู่หน้าเลือกร้าน — คลิกเลือก Nerd… (รอบ ' + (attempt + 1) + ')');
+      await page.waitForTimeout(1500);
+      // คลิกการ์ด/ปุ่มที่มีคำว่า Nerd (แบรนด์ หรือ ร้าน)
+      const clicked = await page.getByText(/Nerd/i).first().click({ timeout: 8000 }).then(() => true).catch(() => false);
+      if (!clicked) { await page.screenshot({ path: 'choose_failed.png', fullPage: true }); break; }
+      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+    }
+    log('store context พร้อม — url =', page.url());
 
     // ---------- 2) เยี่ยมหน้ารายงานเพื่อกระตุ้นให้ยิง API ----------
     log('เปิดหน้าสรุปยอดขายสินค้า…');
@@ -152,6 +166,8 @@ async function main() {
 
     await replay('querySalesItemReport', { startTime: range.startTime, endTime: range.endTime, storeId: STORE });
     await replay('queryBusinessTrendReport', { startTime: range.startTime, endTime: range.endTime, storeId: STORE });
+    // สต็อก: กันเหนียว replay ใส่ storeId (เผื่อ natural call ยังไม่มี store context)
+    await replay('queryAlertNum', { storeId: STORE });
 
     // ---------- 4) DUMP ข้อมูลดิบให้เห็นโครงสร้างจริง ----------
     const dump = {};
@@ -224,10 +240,14 @@ function buildMessage(cap, range) {
   }
 
   // ---- สต็อกต่ำ ----
-  const alert = cap.queryAlertNum && cap.queryAlertNum.response;
-  const warn = alert && alert.data && alert.data.metric && alert.data.metric.warnSpuCount;
-  const invResp = cap.queryInvSpuListManage && (cap.queryInvSpuListManage.lowStock || cap.queryInvSpuListManage.response);
-  const invList = invResp && invResp.data && (invResp.data.list || invResp.data.records);
+  // count: จาก natural response หรือ replay (queryAlertNum)
+  const alertCand = [cap.queryAlertNum && cap.queryAlertNum.response, cap.queryAlertNum && cap.queryAlertNum.todayResponse]
+    .find(a => a && a.success && a.data && a.data.metric);
+  const warn = alertCand && alertCand.data.metric.warnSpuCount;
+  // รายชื่อสินค้าใกล้หมด: จากแท็บแจ้งเตือนสต็อก (lowStock) หรือ response ที่ success
+  const invCand = [cap.queryInvSpuListManage && cap.queryInvSpuListManage.lowStock, cap.queryInvSpuListManage && cap.queryInvSpuListManage.response]
+    .find(a => a && a.success && a.data && (a.data.list || a.data.records));
+  const invList = invCand && (invCand.data.list || invCand.data.records);
   lines.push('');
   lines.push('⚠️ สินค้าใกล้หมด: ' + (warn != null ? warn + ' รายการ' : '-'));
   if (Array.isArray(invList) && invList.length) {
