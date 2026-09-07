@@ -1,0 +1,13 @@
+{
+  "name": "gpos-line-notify",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ดึงสรุปยอดขาย/สต็อกจาก GPOS แล้วส่งเข้า LINE (Nerd Cafe CNX)",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node fetch_gpos.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}
