@@ -196,8 +196,10 @@ async function main() {
     console.log('=========================================================\n');
     log('บันทึก gpos_raw.json แล้ว (ดูโครงสร้างเต็มใน artifact)');
 
-    // ---------- 5) ประกอบข้อความ (best-effort) + ส่ง LINE (ถ้าเปิด SEND_LINE) ----------
-    const msg = buildMessage(captures, range);
+    // ---------- 5) ประกอบข้อความ + ดึงเวลาพนักงาน + ส่ง LINE (ถ้าเปิด SEND_LINE) ----------
+    let msg = buildMessage(captures, range);
+    const staffSection = await getStaffSection();  // จาก Attendance API (ถ้าตั้งค่าไว้)
+    if (staffSection) msg += '\n' + staffSection;
     console.log('\n---------- ตัวอย่างข้อความ LINE ----------\n' + msg + '\n----------------------------------------\n');
 
     if (process.env.SEND_LINE === '1') {
@@ -267,6 +269,27 @@ function buildMessage(cap, range) {
   }
 
   return lines.join('\n');
+}
+
+/** ดึงเวลาเข้า-ออกพนักงานวันนี้ จาก Attendance API (Apps Script) แล้วประกอบเป็นข้อความ */
+async function getStaffSection() {
+  const url = process.env.ATTENDANCE_API_URL;
+  if (!url) return '';   // ยังไม่ตั้งค่า → ข้าม
+  try {
+    const res = await fetch(url, { redirect: 'follow' });
+    const j = await res.json();
+    if (!j || !Array.isArray(j.staff) || j.staff.length === 0) {
+      return '👥 พนักงานวันนี้:\n- ยังไม่มีข้อมูลการเข้างาน';
+    }
+    const lines = ['👥 พนักงานวันนี้ (' + j.count + ' คน):'];
+    j.staff.forEach(s => {
+      lines.push('- ' + s.name + ': ' + (s.inTime || '-') + ' - ' + (s.outTime || 'ยังไม่ออก'));
+    });
+    return lines.join('\n');
+  } catch (e) {
+    log('ดึงเวลาพนักงานไม่ได้:', e.message);
+    return '👥 พนักงานวันนี้: (ดึงข้อมูลไม่ได้)';
+  }
 }
 
 /** ส่งข้อความเข้า LINE ผ่าน Messaging API (push ทีละผู้รับ) */
