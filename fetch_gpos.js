@@ -164,7 +164,7 @@ async function main() {
       return j;
     }
 
-    await replay('querySalesItemReport', { startTime: range.startTime, endTime: range.endTime, storeId: STORE });
+    await replay('querySalesItemReport', { startTime: range.startTime, endTime: range.endTime, storeId: STORE, pageNum: 1, pageSize: 500 });
     await replay('queryBusinessTrendReport', { startTime: range.startTime, endTime: range.endTime, storeId: STORE });
     // สต็อก: กันเหนียว replay ใส่ storeId (เผื่อ natural call ยังไม่มี store context)
     await replay('queryAlertNum', { storeId: STORE });
@@ -242,6 +242,23 @@ function buildMessage(cap, range) {
     items.sort((a, b) => b.qty - a.qty).slice(0, 5).forEach((x, i) => {
       lines.push(`${i + 1}. ${x.name}  ×${x.qty}  (${baht(x.amt)}฿)`);
     });
+
+    // ---- นับแก้วเย็น / แก้วร้อน / แก้วฟรี จากรายการทั้งหมด ----
+    // ฟรี = โปรโมชัน เมนูชื่อ "แก้วฟรี" (มีคำว่า "ฟรี") → นับแยกต่างหาก
+    // ร้อน = มีคำว่า "ร้อน"
+    // เย็น = "เย็น" / "ปั่น" / "โซดา" / "สมูทตี้" (ทั้งหมดใช้แก้วเย็น)
+    // อาหาร (เค้ก/แซนวิช ฯลฯ) ไม่มีคีย์เวิร์ดพวกนี้ → ไม่ถูกนับ
+    let hotCups = 0, coldCups = 0, freeCups = 0;
+    items.forEach(x => {
+      const nm = String(x.name || '');
+      if (nm.indexOf('ฟรี') >= 0) freeCups += x.qty;
+      else if (nm.indexOf('ร้อน') >= 0) hotCups += x.qty;
+      else if (/เย็น|ปั่น|โซดา|สมูทตี้|สมูตตี้/.test(nm)) coldCups += x.qty;
+    });
+    lines.push('');
+    lines.push('🥤 แก้วเย็น: ' + coldCups + ' แก้ว');
+    lines.push('☕ แก้วร้อน: ' + hotCups + ' แก้ว');
+    lines.push('🎁 แก้วฟรี: ' + freeCups + ' แก้ว');
   } else {
     lines.push('💰 วันนี้ยังไม่มียอดขาย');
   }
