@@ -168,11 +168,9 @@ async function main() {
     await replay('queryBusinessTrendReport', { startTime: range.startTime, endTime: range.endTime, storeId: STORE });
     // สต็อก: กันเหนียว replay ใส่ storeId (เผื่อ natural call ยังไม่มี store context)
     await replay('queryAlertNum', { storeId: STORE });
-    // รายชื่อสินค้าใกล้หมด: replay ใส่ storeId + filter สต็อกต่ำ (ลองหลายชื่อ param)
-    await replay('queryInvSpuListManage', {
-      storeId: STORE, pageNum: 1, pageSize: 30,
-      alertType: 'WARN', warnStatus: 'WARN', stockWarn: true, tabType: 'WARN', inventoryAlertType: 'STOCK_WARN'
-    });
+    // รายชื่อสินค้า: ดึงมาทั้งหมด (pageSize ใหญ่) แล้วค่อยกรองวัตถุดิบสต็อกต่ำเองฝั่งเรา
+    // (server ไม่รับ filter สต็อกต่ำ — คืนทุกอย่างมาอยู่ดี)
+    await replay('queryInvSpuListManage', { storeId: STORE, pageNum: 1, pageSize: 500 });
 
     // ---------- 4) DUMP ข้อมูลดิบให้เห็นโครงสร้างจริง ----------
     const dump = {};
@@ -263,27 +261,33 @@ function buildMessage(cap, range) {
     lines.push('💰 วันนี้ยังไม่มียอดขาย');
   }
 
-  // ---- สต็อกต่ำ ----
-  // count: จาก natural response หรือ replay (queryAlertNum)
-  const alertCand = [cap.queryAlertNum && cap.queryAlertNum.response, cap.queryAlertNum && cap.queryAlertNum.todayResponse]
-    .find(a => a && a.success && a.data && a.data.metric);
-  const warn = alertCand && alertCand.data.metric.warnSpuCount;
-  // รายชื่อสินค้าใกล้หมด: จากแท็บแจ้งเตือนสต็อก (lowStock) / replay (todayResponse) / response
+  // ---- วัตถุดิบที่ต้องสั่ง (กรองเฉพาะ productType=METERIAL ที่สต็อกต่ำ/หมด/ติดลบ) ----
+  // เมนูเครื่องดื่ม/อาหาร (productType=SINGLE) ที่สต็อก 0 เป็นเรื่องปกติ → ไม่นับ
   const invCand = [
     cap.queryInvSpuListManage && cap.queryInvSpuListManage.lowStock,
     cap.queryInvSpuListManage && cap.queryInvSpuListManage.todayResponse,
     cap.queryInvSpuListManage && cap.queryInvSpuListManage.response
   ].find(a => a && a.success && a.data && (a.data.list || a.data.records));
-  let invList = invCand && (invCand.data.list || invCand.data.records);
+  const invList = (invCand && (invCand.data.list || invCand.data.records)) || [];
+
+  // สถานะสต็อกอยู่ใน skuList[0].stockStatus: FULL(พอ) / LOW(ต่ำ) / EMPTY(หมด=0) / NEGATIVE(ติดลบ)
+  const RANK = { NEGATIVE: 0, EMPTY: 1, LOW: 2 };  // เรียงความเร่งด่วน (ติดลบ→หมด→ต่ำ)
+  const mats = invList
+    .filter(it => it && it.productType === 'METERIAL')
+    .map(it => {
+      const sku = (it.skuList && it.skuList[0]) || {};
+      return { name: it.productName || '-', status: sku.stockStatus, stock: Number(it.stock != null ? it.stock : sku.stock) };
+    })
+    .filter(m => m.status in RANK)   // เอาเฉพาะ 3 สถานะที่ต้องสั่ง
+    .sort((a, b) => (RANK[a.status] - RANK[b.status]) || (a.stock - b.stock));
+
   lines.push('');
-  lines.push('⚠️ สินค้าใกล้หมด: ' + (warn != null ? warn + ' รายการ' : '-'));
-  // แสดงรายชื่อเฉพาะเมื่อ list สั้นพอ (แปลว่ากรองสต็อกต่ำสำเร็จ ไม่ใช่รายการทั้งหมด)
-  if (Array.isArray(invList) && invList.length && invList.length <= 15) {
-    invList.slice(0, 12).forEach(it => {
-      const name = it.productName || it.itemTitle || it.name || it.spuName || '-';
-      lines.push('• ' + name);
-    });
-  }
+  lines.push('⚠️ วัตถุดิบที่ต้องสั่ง: ' + mats.length + ' รายการ');
+  const label = m => m.status === 'NEGATIVE' ? 'ติดลบ ' + m.stock
+    : m.status === 'EMPTY' ? 'หมด'
+    : 'เหลือ ' + m.stock;
+  mats.slice(0, 10).forEach(m => lines.push('• ' + m.name + ' (' + label(m) + ')'));
+  if (mats.length > 10) lines.push('…และอีก ' + (mats.length - 10) + ' รายการ (ดูทั้งหมดใน GPOS)');
 
   return lines.join('\n');
 }
