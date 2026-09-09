@@ -3,7 +3,7 @@ name: GPOS to LINE summary
 on:
   workflow_dispatch:
   schedule:
-    - cron: '45 16 * * *'    
+    - cron: '45 9 * * *'    
 
 jobs:
   run:
