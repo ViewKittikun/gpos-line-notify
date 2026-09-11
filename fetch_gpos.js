@@ -25,6 +25,10 @@ const TZ_OFFSET_MS = 7 * 3600 * 1000;           // Asia/Bangkok = UTC+7
 const USER = process.env.GPOS_USER;
 const PASS = process.env.GPOS_PASS;
 
+// ปลายทางสมุดบัญชี Nerd Cafe (Apps Script web app) — ตั้งใน GitHub Secrets (repo นี้ public)
+const LEDGER_URL   = process.env.LEDGER_URL || '';
+const LEDGER_TOKEN = process.env.LEDGER_TOKEN || '';
+
 // service ที่เราสนใจ (จะดักทั้ง request+response ตามชื่อนี้)
 const SERVICES = [
   'querySalesItemReport',       // ยอดขายรายสินค้า = เมนูขายดี + ยอดรวม
@@ -207,6 +211,9 @@ async function main() {
       log('ยังไม่ส่ง LINE (ตั้ง SEND_LINE=1 เมื่อพร้อม)');
     }
 
+    // ---------- 6) ยิงยอดขาย+จำนวนแก้ววันนี้เข้าสมุดบัญชี Nerd Cafe ----------
+    await pushLedger(captures, range);
+
   } finally {
     await browser.close();
   }
@@ -311,6 +318,41 @@ async function getStaffSection() {
     log('ดึงเวลาพนักงานไม่ได้:', e.message);
     return '👥 พนักงานวันนี้: (ดึงข้อมูลไม่ได้)';
   }
+}
+
+/** คำนวณ {income (บาท), cups (เย็น+ร้อน+ฟรี)} ของวันนี้ จาก querySalesItemReport */
+function computeDaily(cap) {
+  const sales = (cap.querySalesItemReport && (cap.querySalesItemReport.todayResponse || cap.querySalesItemReport.response)) || null;
+  const data = sales && sales.data;
+  const list = (data && (data.list || data.salesReportModelList)) || [];
+  if (!Array.isArray(list) || !list.length) return { income: 0, cups: 0 };
+  const items = list.map(it => ({ name: it.itemTitle || '-', qty: Number(it.sales || 0), amt: Number((it.salesPrice && it.salesPrice.amount) || 0) }));
+  const stat = (data.statisticalData || []).find(s => s.key === 'SALES_AMOUNT');
+  const totalRaw = (stat && stat.value && stat.value.amount) || items.reduce((s, x) => s + x.amt, 0);
+  let cups = 0;
+  items.forEach(x => {
+    const nm = String(x.name || '');
+    if (nm.indexOf('ฟรี') >= 0) cups += x.qty;
+    else if (nm.indexOf('ร้อน') >= 0) cups += x.qty;
+    else if (/เย็น|ปั่น|โซดา|สมูทตี้|สมูตตี้/.test(nm)) cups += x.qty;
+  });
+  return { income: Math.round(totalRaw / 1000 * 100) / 100, cups: cups };  // amount ÷1000 = บาท
+}
+
+/** ยิงยอดขาย+จำนวนแก้ววันนี้เข้าสมุดบัญชี Nerd Cafe (Apps Script) */
+async function pushLedger(cap, range) {
+  if (!LEDGER_URL || !LEDGER_TOKEN) { log('ข้ามส่งสมุดบัญชี — ยังไม่ตั้ง LEDGER_URL / LEDGER_TOKEN'); return; }
+  try {
+    const d = computeDaily(cap);
+    const date = new Date(range.startTime + TZ_OFFSET_MS).toISOString().slice(0, 10);
+    const r = await fetch(LEDGER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: LEDGER_TOKEN, date: date, income: d.income, cups: d.cups }),
+      redirect: 'follow'
+    });
+    log('ส่งเข้าสมุดบัญชี:', r.status, '| date', date, 'income', d.income, 'cups', d.cups);
+  } catch (e) { log('ส่งสมุดบัญชีไม่ได้:', e.message); }
 }
 
 /** ส่งข้อความเข้า LINE ผ่าน Messaging API (push ทีละผู้รับ) */
