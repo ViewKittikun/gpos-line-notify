@@ -1,9 +1,9 @@
-name: GPOS to LINE summary
+name: GPOS → LINE สรุปยอดขาย
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # กดรันเองได้จากแท็บ Actions (ใช้ทดสอบ)
   schedule:
-    - cron: '45 9 * * *'    
+    - cron: '45 9 * * *'    # ทุกวัน 16:45 น. เวลาไทย (09:45 UTC) — GitHub อ่าน cron เป็น UTC เสมอ! อย่าตั้งเป็น 16
 
 jobs:
   run:
@@ -26,7 +26,9 @@ jobs:
           GPOS_PASS: ${{ secrets.GPOS_PASS }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_TO: ${{ secrets.LINE_TO }}
-          ATTENDANCE_API_URL: ${{ secrets.ATTENDANCE_API_URL }}
+          ATTENDANCE_API_URL: ${{ secrets.ATTENDANCE_API_URL }}   # URL /exec ของ Attendance API
+          LEDGER_URL: ${{ secrets.LEDGER_URL }}                   # URL /exec ของสมุดบัญชี Nerd Cafe
+          LEDGER_TOKEN: ${{ secrets.LEDGER_TOKEN }}               # โทเคนกันยิงมั่ว (= POST_TOKEN ใน Code.gs)
           SEND_LINE: '1'
         run: npm start
 
