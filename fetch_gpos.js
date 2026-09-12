@@ -198,21 +198,24 @@ async function main() {
     console.log('=========================================================\n');
     log('บันทึก gpos_raw.json แล้ว (ดูโครงสร้างเต็มใน artifact)');
 
-    // ---------- 5) ประกอบข้อความ + ดึงเวลาพนักงาน + ส่ง LINE (ถ้าเปิด SEND_LINE) ----------
-    let msg = buildMessage(captures, range);
-    const staffSection = await getStaffSection();  // จาก Attendance API (ถ้าตั้งค่าไว้)
-    if (staffSection) msg += '\n' + staffSection;
-    console.log('\n---------- ตัวอย่างข้อความ LINE ----------\n' + msg + '\n----------------------------------------\n');
-
+    // ---------- 5) LINE — เฉพาะรอบสรุป (SEND_LINE=1, ยิงวันละครั้ง 16:41) ----------
     if (process.env.SEND_LINE === '1') {
+      let msg = buildMessage(captures, range);
+      const staffSection = await getStaffSection();  // Attendance API (ถ้าตั้งไว้)
+      if (staffSection) msg += '\n' + staffSection;
+      console.log('\n---------- ข้อความ LINE ----------\n' + msg + '\n----------------------------------\n');
       await sendLine(msg);
       log('ส่งเข้า LINE แล้ว ✓');
     } else {
-      log('ยังไม่ส่ง LINE (ตั้ง SEND_LINE=1 เมื่อพร้อม)');
+      log('ข้าม LINE (SEND_LINE != 1)');
     }
 
-    // ---------- 6) ยิงยอดขาย+จำนวนแก้ววันนี้เข้าสมุดบัญชี Nerd Cafe ----------
-    await pushLedger(captures, range);
+    // ---------- 6) เขียนจำนวนสินค้าลง NerdDoc — เฉพาะรอบเปิดร้าน (WRITE_SHEET=1, ทุก 30 นาที 07:30–15:30) ----------
+    if (process.env.WRITE_SHEET === '1') {
+      await pushNerdFill(captures, range);
+    } else {
+      log('ข้ามเขียน NerdDoc (WRITE_SHEET != 1)');
+    }
 
   } finally {
     await browser.close();
@@ -320,39 +323,41 @@ async function getStaffSection() {
   }
 }
 
-/** คำนวณ {income (บาท), cups (เย็น+ร้อน+ฟรี)} ของวันนี้ จาก querySalesItemReport */
-function computeDaily(cap) {
+/** นับจำนวนสินค้าวันนี้ตามหมวด NerdDoc: {cold,hot,free,cake,sandwich} จาก querySalesItemReport
+ *  เย็น = เย็น/ปั่น/โซดา/สมูทตี้ · ร้อน = ร้อน · ฟรี = ฟรี · แซนวิช/เค้ก = ตามชื่อ (ที่ไม่ใช่เครื่องดื่ม) */
+function computeQuantities(cap) {
   const sales = (cap.querySalesItemReport && (cap.querySalesItemReport.todayResponse || cap.querySalesItemReport.response)) || null;
   const data = sales && sales.data;
   const list = (data && (data.list || data.salesReportModelList)) || [];
-  if (!Array.isArray(list) || !list.length) return { income: 0, cups: 0 };
-  const items = list.map(it => ({ name: it.itemTitle || '-', qty: Number(it.sales || 0), amt: Number((it.salesPrice && it.salesPrice.amount) || 0) }));
-  const stat = (data.statisticalData || []).find(s => s.key === 'SALES_AMOUNT');
-  const totalRaw = (stat && stat.value && stat.value.amount) || items.reduce((s, x) => s + x.amt, 0);
-  let cups = 0;
-  items.forEach(x => {
-    const nm = String(x.name || '');
-    if (nm.indexOf('ฟรี') >= 0) cups += x.qty;
-    else if (nm.indexOf('ร้อน') >= 0) cups += x.qty;
-    else if (/เย็น|ปั่น|โซดา|สมูทตี้|สมูตตี้/.test(nm)) cups += x.qty;
+  const q = { cold: 0, hot: 0, free: 0, cake: 0, sandwich: 0 };
+  if (!Array.isArray(list)) return q;
+  list.forEach(it => {
+    const nm = String(it.itemTitle || '');
+    const qty = Number(it.sales || 0);
+    if (nm.indexOf('ฟรี') >= 0) q.free += qty;
+    else if (nm.indexOf('ร้อน') >= 0) q.hot += qty;
+    else if (/เย็น|ปั่น|โซดา|สมูทตี้|สมูตตี้/.test(nm)) q.cold += qty;
+    else if (nm.indexOf('แซนวิช') >= 0) q.sandwich += qty;
+    else if (nm.indexOf('เค้ก') >= 0) q.cake += qty;
   });
-  return { income: Math.round(totalRaw / 1000 * 100) / 100, cups: cups };  // amount ÷1000 = บาท
+  return q;
 }
 
-/** ยิงยอดขาย+จำนวนแก้ววันนี้เข้าสมุดบัญชี Nerd Cafe (Apps Script) */
-async function pushLedger(cap, range) {
-  if (!LEDGER_URL || !LEDGER_TOKEN) { log('ข้ามส่งสมุดบัญชี — ยังไม่ตั้ง LEDGER_URL / LEDGER_TOKEN'); return; }
+/** เขียนจำนวนสินค้าวันนี้ลง NerdDoc ผ่าน Apps Script (type=nerdfill) — แถวจำนวนเท่านั้น */
+async function pushNerdFill(cap, range) {
+  if (!LEDGER_URL || !LEDGER_TOKEN) { log('ข้ามเขียน NerdDoc — ยังไม่ตั้ง LEDGER_URL / LEDGER_TOKEN'); return; }
   try {
-    const d = computeDaily(cap);
+    const q = computeQuantities(cap);
     const date = new Date(range.startTime + TZ_OFFSET_MS).toISOString().slice(0, 10);
     const r = await fetch(LEDGER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: LEDGER_TOKEN, date: date, income: d.income, cups: d.cups }),
+      body: JSON.stringify({ token: LEDGER_TOKEN, type: 'nerdfill', date: date, qty: q }),
       redirect: 'follow'
     });
-    log('ส่งเข้าสมุดบัญชี:', r.status, '| date', date, 'income', d.income, 'cups', d.cups);
-  } catch (e) { log('ส่งสมุดบัญชีไม่ได้:', e.message); }
+    const t = await r.text().catch(() => '');
+    log('เขียน NerdDoc:', r.status, '| date', date, '| qty', JSON.stringify(q), '| resp', String(t).slice(0, 120));
+  } catch (e) { log('เขียน NerdDoc ไม่ได้:', e.message); }
 }
 
 /** ส่งข้อความเข้า LINE ผ่าน Messaging API (push ทีละผู้รับ) */
