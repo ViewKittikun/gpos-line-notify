@@ -1,0 +1,44 @@
+name: GPOS → LINE สรุปยอดขาย
+
+on:
+  workflow_dispatch:        # ยิงจากภายนอก (cron-job.org) ตามเวลาเป๊ะ + กดทดสอบเองได้
+  # หมายเหตุ: ตัด schedule ของ GitHub ออก เพราะดีเลย์เป็นชั่วโมง — ใช้ cron-job.org
+  #           ยิง workflow_dispatch เข้ามาแทน (ตั้งเวลา 16:41 น. Asia/Bangkok เพื่อให้ LINE เข้า ~16:45)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install deps
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Run GPOS fetch
+        env:
+          GPOS_USER: ${{ secrets.GPOS_USER }}
+          GPOS_PASS: ${{ secrets.GPOS_PASS }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_TO: ${{ secrets.LINE_TO }}
+          ATTENDANCE_API_URL: ${{ secrets.ATTENDANCE_API_URL }}   # URL /exec ของ Attendance API
+          LEDGER_URL: ${{ secrets.LEDGER_URL }}                   # URL /exec ของสมุดบัญชี Nerd Cafe
+          LEDGER_TOKEN: ${{ secrets.LEDGER_TOKEN }}               # โทเคนกันยิงมั่ว (= POST_TOKEN ใน Code.gs)
+          SEND_LINE: '1'
+        run: npm start
+
+      - name: Upload raw dump (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpos-debug
+          path: |
+            gpos_raw.json
+            login_failed.png
+          if-no-files-found: ignore
+          retention-days: 7
