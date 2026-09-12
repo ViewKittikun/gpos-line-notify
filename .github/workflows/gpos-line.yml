@@ -2,8 +2,18 @@ name: GPOS → LINE สรุปยอดขาย
 
 on:
   workflow_dispatch:        # ยิงจากภายนอก (cron-job.org) ตามเวลาเป๊ะ + กดทดสอบเองได้
-  # หมายเหตุ: ตัด schedule ของ GitHub ออก เพราะดีเลย์เป็นชั่วโมง — ใช้ cron-job.org
-  #           ยิง workflow_dispatch เข้ามาแทน (ตั้งเวลา 16:41 น. Asia/Bangkok เพื่อให้ LINE เข้า ~16:45)
+    inputs:
+      send_line:
+        description: 'ส่ง LINE สรุป (true เฉพาะรอบ 16:41)'
+        required: false
+        default: 'false'
+      write_sheet:
+        description: 'เขียนจำนวนสินค้าลง NerdDoc (true เฉพาะรอบเปิดร้าน 07:30–15:30)'
+        required: false
+        default: 'false'
+  # หมายเหตุ: ตัด schedule ของ GitHub ออก เพราะดีเลย์เป็นชั่วโมง — ใช้ cron-job.org 2 งาน:
+  #   fill:    ทุก 30 นาที 07:30–15:30  → inputs {send_line:false, write_sheet:true}
+  #   summary: 16:41 วันละครั้ง         → inputs {send_line:true,  write_sheet:false}
 
 jobs:
   run:
@@ -27,9 +37,10 @@ jobs:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_TO: ${{ secrets.LINE_TO }}
           ATTENDANCE_API_URL: ${{ secrets.ATTENDANCE_API_URL }}   # URL /exec ของ Attendance API
-          LEDGER_URL: ${{ secrets.LEDGER_URL }}                   # URL /exec ของสมุดบัญชี Nerd Cafe
+          LEDGER_URL: ${{ secrets.LEDGER_URL }}                   # URL /exec ของสมุดบัญชี Nerd Cafe (Apps Script)
           LEDGER_TOKEN: ${{ secrets.LEDGER_TOKEN }}               # โทเคนกันยิงมั่ว (= POST_TOKEN ใน Code.gs)
-          SEND_LINE: '1'
+          SEND_LINE: ${{ github.event.inputs.send_line == 'true' && '1' || '0' }}
+          WRITE_SHEET: ${{ github.event.inputs.write_sheet == 'true' && '1' || '0' }}
         run: npm start
 
       - name: Upload raw dump (debug)
