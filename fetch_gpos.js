@@ -279,6 +279,11 @@ function buildMessage(cap, range) {
     cap.queryInvSpuListManage && cap.queryInvSpuListManage.response
   ].find(a => a && a.success && a.data && (a.data.list || a.data.records));
   const invList = (invCand && (invCand.data.list || invCand.data.records)) || [];
+  if (!invCand) {
+    lines.push('');
+    lines.push('⚠️ วัตถุดิบที่ต้องสั่ง: (ดึงข้อมูลสต็อกไม่ได้ — เช็คใน GPOS)');
+    return lines.join('\n');
+  }
 
   // สถานะสต็อกอยู่ใน skuList[0].stockStatus: FULL(พอ) / LOW(ต่ำ) / EMPTY(หมด=0) / NEGATIVE(ติดลบ)
   const RANK = { NEGATIVE: 0, EMPTY: 1, LOW: 2 };  // เรียงความเร่งด่วน (ติดลบ→หมด→ต่ำ)
