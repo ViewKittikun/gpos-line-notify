@@ -302,7 +302,29 @@ function buildMessage(cap, range) {
   return lines.join('\n');
 }
 
-/** ดึงเวลาเข้า-ออกพนักงานวันนี้ จาก Attendance API (Apps Script) แล้วประกอบเป็นข้อความ */
+/** ดึงเวลาเข้า-ออกพนักงานวันนี้ จาก Attendance API (Apps Script) แล้วประกอบเป็นข้อความ
+ *  + แสดง 🔴 สาย X นาที ถ้าเข้าหลัง 08:00:00 (ปัดนาทีขึ้น) — กติกาเดียวกับชีท */
+const ATT_LATE_CUTOFF = '08:00:00';
+
+function normTime(s) {
+  s = String(s == null ? '' : s).trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?$/i);
+  if (!m) return s;
+  let h = parseInt(m[1], 10);
+  const ap = (m[4] || '').toUpperCase();
+  if (ap === 'PM' && h < 12) h += 12;
+  if (ap === 'AM' && h === 12) h = 0;
+  return String(h).padStart(2, '0') + ':' + m[2] + ':' + (m[3] || '00');
+}
+
+function lateMinutes(inTime) {
+  const t = normTime(inTime);
+  if (!/^\d{2}:\d{2}:\d{2}$/.test(t)) return 0;
+  const sec = x => { const p = x.split(':').map(Number); return p[0] * 3600 + p[1] * 60 + p[2]; };
+  const diff = sec(t) - sec(ATT_LATE_CUTOFF);
+  return diff > 0 ? Math.ceil(diff / 60) : 0;
+}
+
 async function getStaffSection() {
   const url = process.env.ATTENDANCE_API_URL;
   if (!url) return '';   // ยังไม่ตั้งค่า → ข้าม
@@ -314,7 +336,10 @@ async function getStaffSection() {
     }
     const lines = ['👥 พนักงานวันนี้ (' + j.count + ' คน):'];
     j.staff.forEach(s => {
-      lines.push('- ' + s.name + ': ' + (s.inTime || '-') + ' - ' + (s.outTime || 'ยังไม่ออก'));
+      const inT  = s.inTime  ? normTime(s.inTime)  : '-';
+      const outT = s.outTime ? normTime(s.outTime) : 'ยังไม่ออก';
+      const late = lateMinutes(s.inTime);
+      lines.push('- ' + s.name + ': ' + inT + ' - ' + outT + (late > 0 ? ' 🔴 สาย ' + late + ' นาที' : ''));
     });
     return lines.join('\n');
   } catch (e) {
