@@ -539,8 +539,15 @@ async function collectNerd27(ctx, range) {
     menu.push({ ch: pf.includes('GRAB') ? 'Grab' : (pf === 'POS' || !pf ? 'หน้าร้าน' : pf), name: nm, qty: q, amt: r2(amt(it.salesPrice)) });
   });
 
+  // 5) รายชื่อเมนูทั้งหมดใน GPOS (ไว้หาเมนูที่ไม่เคยขาย) — จากรายการสินค้า ไม่เอาวัตถุดิบ (METERIAL)
+  const invC = [captures.queryInvSpuListManage && captures.queryInvSpuListManage.todayResponse,
+                captures.queryInvSpuListManage && captures.queryInvSpuListManage.response]
+    .find(a => a && a.data && (a.data.list || a.data.records));
+  const catalog = invC ? [...new Set((invC.data.list || invC.data.records)
+    .filter(it => it && it.productName && it.productType !== 'METERIAL').map(it => String(it.productName).trim()))] : [];
+
   const date = new Date(range.startTime + TZ_OFFSET_MS).toISOString().slice(0, 10);
-  const out = { date, gpos: Object.assign({}, money, c, { free }), menu, freeItems, bills: bills.length };
+  const out = { date, gpos: Object.assign({}, money, c, { free }), menu, catalog, freeItems, bills: bills.length };
   log('NerdDoc 2027:', JSON.stringify(out.gpos), '| ฟรี:', freeItems.join(', ') || '-');
   return out;
 }
@@ -550,7 +557,7 @@ async function pushNerd27(d) {
   try {
     const r = await fetch(LEDGER_URL, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, redirect: 'follow',
-      body: JSON.stringify({ token: LEDGER_TOKEN, type: 'nerd27', date: d.date, gpos: d.gpos, menu: d.menu })
+      body: JSON.stringify({ token: LEDGER_TOKEN, type: 'nerd27', date: d.date, gpos: d.gpos, menu: d.menu, catalog: d.catalog })
     });
     const t = await r.text().catch(() => '');
     log('เขียน NerdDoc 2027:', r.status, '| resp', String(t).slice(0, 160));
