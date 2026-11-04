@@ -193,7 +193,7 @@ async function main() {
 
     // ---------- 3.5) บิลของวันนี้ + รายละเอียดบิลที่มีส่วนลด (NerdDoc 2027) ----------
     let nerd27 = null;
-    if (process.env.WRITE_SHEET === '1') {
+    if (process.env.WRITE_SHEET === '1' || process.env.SEND_LINE === '1') {
       try { nerd27 = await collectNerd27(ctx, range); }
       catch (e) { log('เก็บข้อมูล NerdDoc 2027 ไม่ได้:', e.message); }
     }
@@ -223,7 +223,7 @@ async function main() {
 
     // ---------- 5) LINE — เฉพาะรอบสรุป (SEND_LINE=1, ยิงวันละครั้ง 16:41) ----------
     if (process.env.SEND_LINE === '1') {
-      let msg = buildMessage(captures, range);
+      let msg = buildMessage(captures, range, nerd27);
       const staffSection = await getStaffSection();  // Attendance API (ถ้าตั้งไว้)
       if (staffSection) msg += '\n' + staffSection;
       console.log('\n---------- ข้อความ LINE ----------\n' + msg + '\n----------------------------------\n');
@@ -247,7 +247,7 @@ async function main() {
 }
 
 /** ประกอบข้อความสรุป — ใช้ field จริงจาก JSON ที่ดักได้ */
-function buildMessage(cap, range) {
+function buildMessage(cap, range, n27) {
   const baht = n => (Number(n || 0) / 1000).toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const dateLabel = new Date(range.startTime + TZ_OFFSET_MS).toISOString().slice(0, 10);
   let lines = ['📊 สรุปยอดขาย Nerd Cafe CNX', '📅 ' + dateLabel, ''];
@@ -290,7 +290,9 @@ function buildMessage(cap, range) {
     lines.push('');
     lines.push('🥤 แก้วเย็น: ' + coldCups + ' แก้ว');
     lines.push('☕ แก้วร้อน: ' + hotCups + ' แก้ว');
-    lines.push('🎁 แก้วฟรี: ' + freeCups + ' แก้ว');
+    // แก้วฟรีจริง = บรรทัดในบิลที่ลดเต็มราคา (นับรวมอยู่ในแก้วเย็น/ร้อนแล้ว — แสดงไว้ให้รู้เฉย ๆ)
+    if (n27 && n27.gpos) freeCups = n27.gpos.free;
+    lines.push('🎁 แก้วฟรี: ' + freeCups + ' แก้ว' + (n27 && n27.freeItems && n27.freeItems.length ? ' (' + n27.freeItems.join(', ') + ')' : ''));
   } else {
     lines.push('💰 วันนี้ยังไม่มียอดขาย');
   }
@@ -480,8 +482,14 @@ async function collectNerd27(ctx, range) {
   // 2) เงินแยกวิธีชำระ (จาก payMethodInfo ของแต่ละบิล)
   const money = { cash: 0, pp: 0, tr: 0, grab: 0, other: 0, grabN: 0 };
   bills.forEach(b => {
-    if (String(b.platform || '').toUpperCase().includes('GRAB')) money.grabN++;
     const pays = (b.payMethodInfo && b.payMethodInfo.length) ? b.payMethodInfo : [{ payMethodName: b.payMethodName, amount: b.realAmount || b.amount }];
+    const isGrab = /grab/i.test(String(b.platform || '') + ' ' + String(b.subPlatform || '') + ' ' + pays.map(p => p.payMethodName).join(' '));
+    if (isGrab) {
+      // Grab: ใช้ยอดขายที่ไม่รวมค่าจัดส่ง ให้ตรงกับ Grab Merchant (GPOS บวกค่าจัดส่งเล็กน้อยไว้ในบางบิล)
+      money.grabN++;
+      money.grab += Math.max(0, amt(b.realAmount || b.amount) - amt(b.deliveryFee));
+      return;
+    }
     pays.forEach(p => {
       const n = String(p.payMethodName || '').toLowerCase(), a = amt(p.amount);
       if (n.includes('cash') || n.includes('เงินสด')) money.cash += a;
