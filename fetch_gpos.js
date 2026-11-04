@@ -223,8 +223,10 @@ async function main() {
 
     // ---------- 5) LINE — เฉพาะรอบสรุป (SEND_LINE=1, ยิงวันละครั้ง 16:41) ----------
     if (process.env.SEND_LINE === '1') {
-      let msg = buildMessage(captures, range, nerd27);
-      const staffSection = await getStaffSection();  // Attendance API (ถ้าตั้งไว้)
+      let msg;
+      try { msg = await buildMessage27(ctx, captures, range, nerd27); }
+      catch (e) { log('สร้างข้อความแบบใหม่ไม่ได้ — ใช้แบบเดิม:', e.message); msg = buildMessage(captures, range, nerd27); }
+      const staffSection = await getStaffSection(true);  // Attendance API (ถ้าตั้งไว้)
       if (staffSection) msg += '\n' + staffSection;
       console.log('\n---------- ข้อความ LINE ----------\n' + msg + '\n----------------------------------\n');
       await sendLine(msg);
@@ -356,7 +358,7 @@ function lateMinutes(inTime) {
   return diff > 0 ? Math.ceil(diff / 60) : 0;
 }
 
-async function getStaffSection() {
+async function getStaffSection(compact) {
   const url = process.env.ATTENDANCE_API_URL;
   if (!url) return '';   // ยังไม่ตั้งค่า → ข้าม
   try {
@@ -365,12 +367,13 @@ async function getStaffSection() {
     if (!j || !Array.isArray(j.staff) || j.staff.length === 0) {
       return '👥 พนักงานวันนี้:\n- ยังไม่มีข้อมูลการเข้างาน';
     }
-    const lines = ['👥 พนักงานวันนี้ (' + j.count + ' คน):'];
+    const lines = ['👥 พนักงานวันนี้ (' + j.count + ' คน)'];
+    const hm = t => compact ? String(t).slice(0, 5) : t;
     j.staff.forEach(s => {
-      const inT  = s.inTime  ? normTime(s.inTime)  : '-';
-      const outT = s.outTime ? normTime(s.outTime) : 'ยังไม่ออก';
+      const inT  = s.inTime  ? hm(normTime(s.inTime))  : '-';
+      const outT = s.outTime ? hm(normTime(s.outTime)) : 'ยังไม่ออก';
       const late = lateMinutes(s.inTime);
-      lines.push('- ' + s.name + ': ' + inT + ' - ' + outT + (late > 0 ? ' 🔴 สาย ' + late + ' นาที' : ''));
+      lines.push((compact ? '   ' : '- ') + s.name + ' ' + inT + '–' + outT + (late > 0 ? ' 🔴 สาย ' + late + ' นาที' : ''));
     });
     return lines.join('\n');
   } catch (e) {
@@ -562,6 +565,123 @@ async function pushNerd27(d) {
     const t = await r.text().catch(() => '');
     log('เขียน NerdDoc 2027:', r.status, '| resp', String(t).slice(0, 160));
   } catch (e) { log('เขียน NerdDoc 2027 ไม่ได้:', e.message); }
+}
+
+/* ======================= ข้อความสรุป LINE แบบใหม่ (พ.ย. 2026) ======================= */
+async function fetchSummary27(date) {
+  if (!LEDGER_URL || !LEDGER_TOKEN) return null;
+  try {
+    const r = await fetch(LEDGER_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, redirect: 'follow',
+      body: JSON.stringify({ token: LEDGER_TOKEN, type: 'summary27', date }) });
+    const j = await r.json();
+    return j && j.ok ? j.data : null;
+  } catch (e) { log('ดึงข้อมูลปิดยอดไม่ได้:', e.message); return null; }
+}
+
+// ยอดขายรวม (GPOS) ของช่วงเวลาใดก็ได้ — ใช้เทียบกับวันเดียวกันสัปดาห์ก่อน
+async function gposSalesFor(ctx, start, end) {
+  const j = await replayWith(ctx, 'querySalesItemReport', (k, v) => {
+    const isT = /^\d{12,}$/.test(String(v));
+    if (/^(start|begin)/i.test(k) && isT) return typeof v === 'string' ? String(start) : start;
+    if (/^end/i.test(k) && isT) return typeof v === 'string' ? String(end) : end;
+    if (/pageSize/i.test(k)) return 1;
+    if (k === 'storeId') return STORE;
+  });
+  const st = ((j && j.data && j.data.statisticalData) || []).find(x => x.key === 'SALES_AMOUNT');
+  return st ? amt(st.value) : null;
+}
+
+async function buildMessage27(ctx, cap, range, n27) {
+  const B = n => Number(n || 0).toLocaleString('th-TH', { maximumFractionDigits: 2 });
+  const N = v => (v === '' || v === null || v === undefined) ? null : Number(v);
+  const date = new Date(range.startTime + TZ_OFFSET_MS).toISOString().slice(0, 10);
+  const dt = new Date(range.startTime + TZ_OFFSET_MS);
+  const DOW = ['อา.', 'จ.', 'อ.', 'พ.', 'พฤ.', 'ศ.', 'ส.'], MON = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+  const sales = cap.querySalesItemReport && (cap.querySalesItemReport.todayResponse || cap.querySalesItemReport.response);
+  const sdata = sales && sales.data;
+  const stat = ((sdata && sdata.statisticalData) || []).find(x => x.key === 'SALES_AMOUNT');
+  const gposTotal = stat ? amt(stat.value) : 0;
+  const g = (n27 && n27.gpos) || {};
+  const sum = await fetchSummary27(date);
+  const sv = (sum && sum.saved) || null;
+  const lm = sv ? N(sv.lmSale) || 0 : 0, sp = sv ? N(sv.spSale) || 0 : 0;
+  const total = gposTotal + lm + sp;
+
+  const L = ['📊 Nerd Cafe CNX · ' + DOW[dt.getUTCDay()] + ' ' + dt.getUTCDate() + ' ' + MON[dt.getUTCMonth()]];
+  // 1) ยอดขาย + จำนวนบิล + เป้า + เทียบสัปดาห์ก่อน
+  L.push('💰 ยอดขาย ' + B(total) + ' บาท' + (n27 ? ' · ' + n27.bills + ' บิล' : ''));
+  if (lm || sp) L.push('   (GPOS ' + B(gposTotal) + ' + LINE MAN/Shopee ' + B(lm + sp) + ')');
+  const cmp = [];
+  if (sum && sum.goal) cmp.push(total >= sum.goal ? '🎯 ถึงเป้า (฿' + B(sum.goal) + ')' : '🎯 ต่ำกว่าเป้า ฿' + B(sum.goal - total));
+  try {
+    const wk = 7 * 864e5, prev = await gposSalesFor(ctx, range.startTime - wk, range.endTime - wk);
+    if (prev) { const p = Math.round((gposTotal - prev) / prev * 100); cmp.push((p >= 0 ? '↑ ' : '↓ ') + Math.abs(p) + '% จาก ' + DOW[dt.getUTCDay()] + ' ที่แล้ว'); }
+  } catch (e) { log('เทียบสัปดาห์ก่อนไม่ได้:', e.message); }
+  if (cmp.length) L.push('   ' + cmp.join(' · '));
+
+  // 2) ยอดแยกช่องทาง
+  if (n27) {
+    L.push('');
+    L.push('💳 เงินสด ' + B(g.cash) + ' · โอน ' + B((g.pp || 0) + (g.tr || 0)) + ' · Grab ' + B(g.grab) + ' (' + (g.grabN || 0) + ')');
+    L.push('   LINE MAN ' + (sv ? B(lm) + ' (' + (N(sv.lmN) || 0) + ')' : '—') + ' · Shopee ' + (sv ? B(sp) + ' (' + (N(sv.spN) || 0) + ')' : '—'));
+  }
+
+  // 3) สถานะปิดยอดจากหน้ากรอกพนักงาน
+  L.push('');
+  if (sv) {
+    L.push('✅ ปิดยอดแล้ว ' + String(sv.savedAt || '').slice(11) + (sv.staff ? ' (' + sv.staff + ')' : ''));
+    const chk = [];
+    const diff = (label, real, sys) => {
+      if (real === null || sys === null || isNaN(real) || isNaN(sys)) return chk.push(label + ' ยังไม่เช็ค');
+      const d = Math.round((real - sys) * 100) / 100;
+      chk.push(label + (d === 0 ? 'ตรง ✓' : (d > 0 ? 'เกิน ' : 'ขาด ') + B(Math.abs(d)) + ' ⚠️'));
+    };
+    diff('เงินสด', N(sv.cashCount), n27 ? g.cash : null);
+    diff('เงินโอน', N(sv.trReal) === null ? null : N(sv.trReal) - (N(sv.grabTP) || 0), n27 ? (g.pp || 0) + (g.tr || 0) : null);
+    L.push('   ' + chk.join(' · '));
+  } else {
+    L.push('⚠️ ยังไม่ปิดยอด');
+  }
+
+  // 4) รายจ่ายที่พนักงานกรอก
+  const ex = (sum && sum.expenses) || [];
+  if (ex.length) {
+    const CAT = { drink: '🥤', sandwich: '🥪', cake: '🍰' };
+    L.push('');
+    L.push('🧾 รายจ่ายวันนี้ ฿' + B(ex.reduce((a, x) => a + Number(x.amount || 0), 0)));
+    ex.slice(0, 6).forEach(x => L.push('   • ' + (CAT[x.category] || '•') + ' ' + B(x.amount) + (x.note ? ' — ' + x.note : '') + (x.receipt ? ' 🧾' : '')));
+  }
+
+  // 5) เมนูขายดี (รวมชื่อหน้าร้าน + Grab ตามแท็บจับคู่ชื่อเมนู)
+  const map = (sum && sum.menuMap) || {};
+  const canon = n => map[n] !== undefined ? map[n] : String(n).replace(/\s*-\s*(เย็น|ร้อน|ปั่น)$/, '');
+  const agg = {};
+  (n27 ? n27.menu : []).forEach(m => { const c = canon(m.name); if (!c || c === '-') return; agg[c] = (agg[c] || 0) + Number(m.qty || 0); });
+  const top = Object.entries(agg).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  L.push('');
+  if (top.length) L.push('🏆 ขายดี: ' + top.map(([k, v]) => k + ' ' + v).join(' · '));
+  if (n27) L.push('🥤 เย็น ' + (g.cold || 0) + ' · ☕ ร้อน ' + (g.hot || 0) + ' · 🎁 ฟรี ' + (g.free || 0) + ' (รวม ' + ((g.cold || 0) + (g.hot || 0)) + ' แก้ว)');
+
+  // 6) วัตถุดิบ: ต้องสั่ง (ต่ำ/หมด) แยกจากสต็อกในระบบติดลบ
+  const invCand = [cap.queryInvSpuListManage && cap.queryInvSpuListManage.todayResponse, cap.queryInvSpuListManage && cap.queryInvSpuListManage.response]
+    .find(a => a && a.success && a.data && (a.data.list || a.data.records));
+  if (invCand) {
+    const mats = (invCand.data.list || invCand.data.records).filter(it => it && it.productType === 'METERIAL').map(it => {
+      const sku = (it.skuList && it.skuList[0]) || {};
+      return { name: it.productName || '-', status: sku.stockStatus, stock: Number(it.stock != null ? it.stock : sku.stock) };
+    });
+    const need = mats.filter(m => m.status === 'LOW' || m.status === 'EMPTY').sort((a, b) => a.stock - b.stock);
+    const neg = mats.filter(m => m.status === 'NEGATIVE');
+    L.push('');
+    if (need.length) {
+      L.push('⚠️ ต้องสั่ง: ' + need.slice(0, 8).map(m => m.name + (m.status === 'EMPTY' ? ' (หมด)' : ' (เหลือ ' + m.stock + ')')).join(', ') + (need.length > 8 ? ' …+' + (need.length - 8) : ''));
+    } else L.push('✅ วัตถุดิบใน GPOS ไม่มีรายการใกล้หมด');
+    if (neg.length) {
+      neg.sort((a, b) => a.stock - b.stock);
+      L.push('🔢 สต็อกติดลบ (ควรนับใหม่): ' + neg.slice(0, 8).map(m => m.name + ' (' + m.stock + ')').join(', ') + (neg.length > 8 ? ' …+' + (neg.length - 8) : ''));
+    }
+  }
+  return L.join('\n');
 }
 
 /** ส่งข้อความเข้า LINE ผ่าน Messaging API (push ทีละผู้รับ) */
