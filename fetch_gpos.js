@@ -487,7 +487,7 @@ async function collectNerd27(ctx, range) {
     if (isGrab) {
       // Grab: ใช้ยอดขายที่ไม่รวมค่าจัดส่ง ให้ตรงกับ Grab Merchant (GPOS บวกค่าจัดส่งเล็กน้อยไว้ในบางบิล)
       money.grabN++;
-      money.grab += Math.max(0, amt(b.realAmount || b.amount) - amt(b.deliveryFee));
+      money.grab += Math.max(0, amt(b.amount || b.realAmount) - amt(b.deliveryFee));   // ยอดก่อนส่วนลดร้าน (= ยอดขายสุทธิใน Grab Merchant)
       return;
     }
     pays.forEach(p => {
