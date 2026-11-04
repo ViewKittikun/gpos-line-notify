@@ -154,7 +154,7 @@ async function main() {
       await page.waitForTimeout(2500);
       try {
         const waitDet = page.waitForResponse(r => r.url().includes('queryStoreOrderSettledInfo'), { timeout: 15000 }).catch(() => null);
-        await page.getByText('รายละเอียด', { exact: true }).first().click({ timeout: 8000 });
+        await page.getByText('รายละเอียด', { exact: true }).first().click({ timeout: 4000 });
         await waitDet;
         await page.keyboard.press('Escape').catch(() => {});
       } catch (e) { log('  (เปิดรายละเอียดบิลไม่ได้: ' + e.message + ')'); }
@@ -427,13 +427,33 @@ function patchBody(obj, f) {
 }
 
 // ยิง service ซ้ำด้วย headers + envelope จริงที่ดักได้ (มี token ครบ) แล้วแก้ค่าใน body ตาม patcher
-async function replayWith(ctx, svc, patcher) {
+// body เริ่มต้นของ service ที่หน้าเว็บอาจไม่ได้ยิงให้ดัก (CI เลือกร้านไม่ได้ → หน้ารายงานบิลไม่โหลด)
+// รูปแบบดูจากหน้าเว็บจริง (พ.ย. 2026)
+const DEFAULT_BODY = {
+  queryStoreSalesSettledDetailReport: { startTime: 0, endTime: 0, startHour: -1, endHour: -1, pageSize: 200, pageNum: 1, storeId: STORE },
+  queryStoreOrderSettledInfo: { orderId: '', storeId: STORE }
+};
+
+// ถ้าไม่มีแม่แบบของ service นี้ → สร้างจากแม่แบบของ querySalesItemReport (envelope/headers/token ชุดเดียวกัน แค่เปลี่ยนชื่อ service)
+function templateFor(svc) {
   const cap = captures[svc];
-  if (!cap || !cap.request || !cap.request.body) throw new Error('ไม่มีแม่แบบ request ของ ' + svc);
-  const env = JSON.parse(JSON.stringify(cap.request.body));
+  if (cap && cap.request && cap.request.body) return { headers: cap.request.headers, body: JSON.parse(JSON.stringify(cap.request.body)) };
+  const base = captures.querySalesItemReport;
+  if (!base || !base.request || !base.request.body || !DEFAULT_BODY[svc]) throw new Error('ไม่มีแม่แบบ request ของ ' + svc);
+  const swap = x => JSON.parse(JSON.stringify(x).split('querySalesItemReport').join(svc));
+  const body = swap(base.request.body);
+  if (body.httpData) body.httpData.body = JSON.parse(JSON.stringify(DEFAULT_BODY[svc]));
+  const headers = swap(base.request.headers);
+  return { headers, body };
+}
+
+async function replayWith(ctx, svc, patcher) {
+  const t = templateFor(svc), env = t.body;
   patchBody(env.httpData && env.httpData.body ? env.httpData.body : env, patcher);
-  const resp = await ctx.request.post('https://api-th1.biot-apps.com/?serviceName=' + svc, { headers: cap.request.headers, data: env });
-  return await resp.json();
+  const resp = await ctx.request.post('https://api-th1.biot-apps.com/?serviceName=' + svc, { headers: t.headers, data: env });
+  const j = await resp.json();
+  if (j && j.success === false) log('  ' + svc + ' ตอบ error:', JSON.stringify(j).slice(0, 200));
+  return j;
 }
 
 const amt = x => Number(x && typeof x === 'object' ? x.amount : x || 0) / 1000;   // GPOS เก็บเงินเป็น 1/1000 บาท
@@ -444,9 +464,9 @@ async function collectNerd27(ctx, range) {
   const bills = [];
   for (let pg = 1; pg <= 10; pg++) {
     const j = await replayWith(ctx, 'queryStoreSalesSettledDetailReport', (k, v) => {
-      const isT = typeof v === 'number' || /^\d{12,}$/.test(String(v));   // epoch ms (ตัวเลขหรือข้อความ)
-      if (/^(start|begin)/i.test(k) && isT) return typeof v === 'number' ? range.startTime : String(range.startTime);
-      if (/^end/i.test(k) && isT) return typeof v === 'number' ? range.endTime : String(range.endTime);
+      const isT = /^\d{12,}$/.test(String(v));   // epoch ms เท่านั้น (ไม่แตะ startHour/endHour = -1)
+      if (/^(start|begin)/i.test(k) && (isT || v === 0)) return typeof v === 'string' ? String(range.startTime) : range.startTime;
+      if (/^end/i.test(k) && (isT || v === 0)) return typeof v === 'string' ? String(range.endTime) : range.endTime;
       if (/pageSize/i.test(k)) return 200;
       if (/pageNum|^current$|^page$/i.test(k)) return pg;
       if (k === 'storeId') return STORE;
