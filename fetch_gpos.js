@@ -578,22 +578,41 @@ async function fetchSummary27(date) {
   } catch (e) { log('ดึงข้อมูลปิดยอดไม่ได้:', e.message); return null; }
 }
 
-// ยอดขายรวม (GPOS) ของช่วงเวลาใดก็ได้ — ใช้เทียบกับวันเดียวกันสัปดาห์ก่อน
-async function gposSalesFor(ctx, start, end) {
-  const j = await replayWith(ctx, 'querySalesItemReport', (k, v) => {
-    const isT = /^\d{12,}$/.test(String(v));
-    if (/^(start|begin)/i.test(k) && isT) return typeof v === 'string' ? String(start) : start;
-    if (/^end/i.test(k) && isT) return typeof v === 'string' ? String(end) : end;
-    if (/pageSize/i.test(k)) return 1;
-    if (k === 'storeId') return STORE;
+// ยอดขายรวมจากรายการบิล (วิธีเดียวกับยอดวันนี้: payMethodInfo − ค่าจัดส่ง Grab) — ใช้เทียบกับวันเดียวกันสัปดาห์ก่อน
+function billsTotal(bills) {
+  let t = 0;
+  bills.forEach(b => {
+    const pays = (b.payMethodInfo && b.payMethodInfo.length) ? b.payMethodInfo : [{ payMethodName: b.payMethodName, amount: b.realAmount || b.amount }];
+    const s = pays.reduce((x, p) => x + amt(p.amount), 0);
+    const isGrab = /grab/i.test(String(b.platform || '') + ' ' + String(b.subPlatform || '') + ' ' + pays.map(p => p.payMethodName).join(' '));
+    t += isGrab ? Math.max(0, s - amt(b.deliveryFee)) : s;
   });
-  const st = ((j && j.data && j.data.statisticalData) || []).find(x => x.key === 'SALES_AMOUNT');
-  return st ? amt(st.value) : null;
+  return r2(t);
+}
+async function gposSalesFor(ctx, start, end) {
+  const bills = [];
+  for (let pg = 1; pg <= 10; pg++) {
+    const j = await replayWith(ctx, 'queryStoreSalesSettledDetailReport', (k, v) => {
+      const isT = /^\d{12,}$/.test(String(v));
+      if (/^(start|begin)/i.test(k) && (isT || v === 0)) return typeof v === 'string' ? String(start) : start;
+      if (/^end/i.test(k) && (isT || v === 0)) return typeof v === 'string' ? String(end) : end;
+      if (/pageSize/i.test(k)) return 200;
+      if (/pageNum|^current$|^page$/i.test(k)) return pg;
+      if (k === 'storeId') return STORE;
+    });
+    const list = (j && j.data && (j.data.list || j.data.records)) || [];
+    bills.push(...list);
+    if (list.length < 200) break;
+  }
+  const t = billsTotal(bills);
+  log('ยอดสัปดาห์ก่อน (วันเดียวกัน):', bills.length, 'บิล =', t);
+  return bills.length ? t : null;
 }
 
 async function buildMessage27(ctx, cap, range, n27) {
   const B = n => Number(n || 0).toLocaleString('th-TH', { maximumFractionDigits: 2 });
   const N = v => (v === '' || v === null || v === undefined) ? null : Number(v);
+  const LINE = '━━━━━━━━━━━━━━';
   const date = new Date(range.startTime + TZ_OFFSET_MS).toISOString().slice(0, 10);
   const dt = new Date(range.startTime + TZ_OFFSET_MS);
   const DOW = ['อา.', 'จ.', 'อ.', 'พ.', 'พฤ.', 'ศ.', 'ส.'], MON = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
@@ -607,43 +626,75 @@ async function buildMessage27(ctx, cap, range, n27) {
   const lm = sv ? N(sv.lmSale) || 0 : 0, sp = sv ? N(sv.spSale) || 0 : 0;
   const total = gposTotal + lm + sp;
 
+  // เรื่องที่ต้องดู (รวมไว้บล็อกเดียวด้านบน)
+  const alerts = [];
+  let closeLine = '';
+  if (sv) {
+    closeLine = '✅ ปิดยอดแล้ว ' + String(sv.savedAt || '').slice(11) + (sv.staff ? ' (' + sv.staff + ')' : '');
+    const diff = (label, real, sys) => {
+      if (real === null || sys === null || isNaN(real) || isNaN(sys)) return alerts.push(label + 'ยังไม่ได้เช็ค');
+      const d = Math.round((real - sys) * 100) / 100;
+      if (d !== 0) alerts.push(label + (d > 0 ? 'เกิน ' : 'ขาด ') + B(Math.abs(d)) + ' บาท');
+    };
+    diff('เงินสด', N(sv.cashCount), n27 ? g.cash : null);
+    diff('เงินโอน', N(sv.trReal) === null ? null : N(sv.trReal) - (N(sv.grabTP) || 0), n27 ? (g.pp || 0) + (g.tr || 0) : null);
+  } else alerts.push('ยังไม่ปิดยอด');
+
+  const invCand = [cap.queryInvSpuListManage && cap.queryInvSpuListManage.todayResponse, cap.queryInvSpuListManage && cap.queryInvSpuListManage.response]
+    .find(a => a && a.success && a.data && (a.data.list || a.data.records));
+  let stockOk = false;
+  if (invCand) {
+    const mats = (invCand.data.list || invCand.data.records).filter(it => it && it.productType === 'METERIAL').map(it => {
+      const sku = (it.skuList && it.skuList[0]) || {};
+      return { name: it.productName || '-', status: sku.stockStatus, stock: Number(it.stock != null ? it.stock : sku.stock) };
+    });
+    const need = mats.filter(m => m.status === 'LOW' || m.status === 'EMPTY').sort((a, b) => a.stock - b.stock);
+    const neg = mats.filter(m => m.status === 'NEGATIVE').sort((a, b) => a.stock - b.stock);
+    const more = (arr) => arr.length > 8 ? ' …+' + (arr.length - 8) : '';
+    if (need.length) alerts.push('ต้องสั่ง: ' + need.slice(0, 8).map(m => m.name + (m.status === 'EMPTY' ? ' (หมด)' : ' (เหลือ ' + m.stock + ')')).join(', ') + more(need));
+    if (neg.length) alerts.push('สต็อกติดลบ ควรนับใหม่: ' + neg.slice(0, 8).map(m => m.name + ' (' + m.stock + ')').join(', ') + more(neg));
+    stockOk = !need.length && !neg.length;
+  }
+
   const L = ['📊 Nerd Cafe CNX · ' + DOW[dt.getUTCDay()] + ' ' + dt.getUTCDate() + ' ' + MON[dt.getUTCMonth()]];
-  // 1) ยอดขาย + จำนวนบิล + เป้า + เทียบสัปดาห์ก่อน
-  L.push('💰 ยอดขาย ' + B(total) + ' บาท' + (n27 ? ' · ' + n27.bills + ' บิล' : ''));
-  if (lm || sp) L.push('   (GPOS ' + B(gposTotal) + ' + LINE MAN/Shopee ' + B(lm + sp) + ')');
+
+  // 1) ยอดขาย (เด่นสุด)
+  L.push(LINE);
+  L.push('💰 ยอดขาย  ' + B(total) + ' บาท');
+  L.push(LINE);
+  const sub = [];
+  if (n27) sub.push(n27.bills + ' บิล');
+  if (lm || sp) sub.push('GPOS ' + B(gposTotal) + ' + LINE MAN/Shopee ' + B(lm + sp));
+  if (sub.length) L.push(sub.join(' · '));
   const cmp = [];
-  if (sum && sum.goal) cmp.push(total >= sum.goal ? '🎯 ถึงเป้า (฿' + B(sum.goal) + ')' : '🎯 ต่ำกว่าเป้า ฿' + B(sum.goal - total));
+  if (sum && sum.goal) cmp.push(total >= sum.goal ? '🎯 ถึงเป้า ฿' + B(sum.goal) : '🎯 ต่ำกว่าเป้า ฿' + B(sum.goal - total));
   try {
     const wk = 7 * 864e5, prev = await gposSalesFor(ctx, range.startTime - wk, range.endTime - wk);
-    if (prev) { const p = Math.round((gposTotal - prev) / prev * 100); cmp.push((p >= 0 ? '↑ ' : '↓ ') + Math.abs(p) + '% จาก ' + DOW[dt.getUTCDay()] + ' ที่แล้ว'); }
+    if (prev) {
+      const p = Math.round((gposTotal - prev) / prev * 100);
+      cmp.push((p > 0 ? '📈 ↑ ' : p < 0 ? '📉 ↓ ' : '➖ ') + Math.abs(p) + '% จาก ' + DOW[dt.getUTCDay()] + ' ที่แล้ว (' + B(prev) + ')');
+    }
   } catch (e) { log('เทียบสัปดาห์ก่อนไม่ได้:', e.message); }
-  if (cmp.length) L.push('   ' + cmp.join(' · '));
+  cmp.forEach(c => L.push(c));
 
-  // 2) ยอดแยกช่องทาง
+  // 2) สถานะ: ถ้ามีเรื่องต้องดู ขึ้นบล็อก 🔴 ชัดๆ / ถ้าเรียบร้อยทั้งหมด ขึ้นบรรทัดเดียว
+  L.push('');
+  if (alerts.length) {
+    L.push('🔴 ต้องดู ' + alerts.length + ' เรื่อง');
+    alerts.forEach(a => L.push('   ▸ ' + a));
+    if (closeLine) L.push(closeLine);
+  } else {
+    L.push(closeLine + ' 👍');
+    L.push('   เงินสดตรง · เงินโอนตรง' + (stockOk ? ' · วัตถุดิบพอ' : ''));
+  }
+
+  // 3) รายละเอียด
+  L.push(LINE);
   if (n27) {
-    L.push('');
     L.push('💳 เงินสด ' + B(g.cash) + ' · โอน ' + B((g.pp || 0) + (g.tr || 0)) + ' · Grab ' + B(g.grab) + ' (' + (g.grabN || 0) + ')');
     L.push('   LINE MAN ' + (sv ? B(lm) + ' (' + (N(sv.lmN) || 0) + ')' : '—') + ' · Shopee ' + (sv ? B(sp) + ' (' + (N(sv.spN) || 0) + ')' : '—'));
   }
 
-  // 3) สถานะปิดยอดจากหน้ากรอกพนักงาน
-  L.push('');
-  if (sv) {
-    L.push('✅ ปิดยอดแล้ว ' + String(sv.savedAt || '').slice(11) + (sv.staff ? ' (' + sv.staff + ')' : ''));
-    const chk = [];
-    const diff = (label, real, sys) => {
-      if (real === null || sys === null || isNaN(real) || isNaN(sys)) return chk.push(label + ' ยังไม่เช็ค');
-      const d = Math.round((real - sys) * 100) / 100;
-      chk.push(label + (d === 0 ? 'ตรง ✓' : (d > 0 ? 'เกิน ' : 'ขาด ') + B(Math.abs(d)) + ' ⚠️'));
-    };
-    diff('เงินสด', N(sv.cashCount), n27 ? g.cash : null);
-    diff('เงินโอน', N(sv.trReal) === null ? null : N(sv.trReal) - (N(sv.grabTP) || 0), n27 ? (g.pp || 0) + (g.tr || 0) : null);
-    L.push('   ' + chk.join(' · '));
-  } else {
-    L.push('⚠️ ยังไม่ปิดยอด');
-  }
-
-  // 4) รายจ่ายที่พนักงานกรอก
   const ex = (sum && sum.expenses) || [];
   if (ex.length) {
     const CAT = { drink: '🥤', sandwich: '🥪', cake: '🍰' };
@@ -652,35 +703,17 @@ async function buildMessage27(ctx, cap, range, n27) {
     ex.slice(0, 6).forEach(x => L.push('   • ' + (CAT[x.category] || '•') + ' ' + B(x.amount) + (x.note ? ' — ' + x.note : '') + (x.receipt ? ' 🧾' : '')));
   }
 
-  // 5) เมนูขายดี (รวมชื่อหน้าร้าน + Grab ตามแท็บจับคู่ชื่อเมนู)
   const map = (sum && sum.menuMap) || {};
   const canon = n => map[n] !== undefined ? map[n] : String(n).replace(/\s*-\s*(เย็น|ร้อน|ปั่น)$/, '');
   const agg = {};
   (n27 ? n27.menu : []).forEach(m => { const c = canon(m.name); if (!c || c === '-') return; agg[c] = (agg[c] || 0) + Number(m.qty || 0); });
   const top = Object.entries(agg).sort((a, b) => b[1] - a[1]).slice(0, 5);
   L.push('');
-  if (top.length) L.push('🏆 ขายดี: ' + top.map(([k, v]) => k + ' ' + v).join(' · '));
-  if (n27) L.push('🥤 เย็น ' + (g.cold || 0) + ' · ☕ ร้อน ' + (g.hot || 0) + ' · 🎁 ฟรี ' + (g.free || 0) + ' (รวม ' + ((g.cold || 0) + (g.hot || 0)) + ' แก้ว)');
-
-  // 6) วัตถุดิบ: ต้องสั่ง (ต่ำ/หมด) แยกจากสต็อกในระบบติดลบ
-  const invCand = [cap.queryInvSpuListManage && cap.queryInvSpuListManage.todayResponse, cap.queryInvSpuListManage && cap.queryInvSpuListManage.response]
-    .find(a => a && a.success && a.data && (a.data.list || a.data.records));
-  if (invCand) {
-    const mats = (invCand.data.list || invCand.data.records).filter(it => it && it.productType === 'METERIAL').map(it => {
-      const sku = (it.skuList && it.skuList[0]) || {};
-      return { name: it.productName || '-', status: sku.stockStatus, stock: Number(it.stock != null ? it.stock : sku.stock) };
-    });
-    const need = mats.filter(m => m.status === 'LOW' || m.status === 'EMPTY').sort((a, b) => a.stock - b.stock);
-    const neg = mats.filter(m => m.status === 'NEGATIVE');
-    L.push('');
-    if (need.length) {
-      L.push('⚠️ ต้องสั่ง: ' + need.slice(0, 8).map(m => m.name + (m.status === 'EMPTY' ? ' (หมด)' : ' (เหลือ ' + m.stock + ')')).join(', ') + (need.length > 8 ? ' …+' + (need.length - 8) : ''));
-    } else L.push('✅ วัตถุดิบใน GPOS ไม่มีรายการใกล้หมด');
-    if (neg.length) {
-      neg.sort((a, b) => a.stock - b.stock);
-      L.push('🔢 สต็อกติดลบ (ควรนับใหม่): ' + neg.slice(0, 8).map(m => m.name + ' (' + m.stock + ')').join(', ') + (neg.length > 8 ? ' …+' + (neg.length - 8) : ''));
-    }
+  if (top.length) {
+    L.push('🏆 ขายดี');
+    top.forEach(([k, v], i) => L.push('   ' + (i + 1) + '. ' + k + ' ' + v));
   }
+  if (n27) L.push('🥤 เย็น ' + (g.cold || 0) + ' · ☕ ร้อน ' + (g.hot || 0) + ' · 🎁 ฟรี ' + (g.free || 0) + ' (รวม ' + ((g.cold || 0) + (g.hot || 0)) + ' แก้ว)');
   return L.join('\n');
 }
 
