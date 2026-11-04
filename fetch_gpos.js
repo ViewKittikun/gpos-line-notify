@@ -34,7 +34,9 @@ const SERVICES = [
   'querySalesItemReport',       // ยอดขายรายสินค้า = เมนูขายดี + ยอดรวม
   'queryBusinessTrendReport',   // ยอดขาย/กำไร รายวัน
   'queryAlertNum',              // จำนวนสินค้าใกล้หมด/หมดอายุ
-  'queryInvSpuListManage'       // รายการสินค้า (แท็บแจ้งเตือนสต็อก = สต็อกต่ำ)
+  'queryInvSpuListManage',      // รายการสินค้า (แท็บแจ้งเตือนสต็อก = สต็อกต่ำ)
+  'queryStoreSalesSettledDetailReport', // รายการบิล (วิธีชำระเงินต่อบิล, ส่วนลดต่อบิล) — หน้า สรุปยอดขายตามใบเสร็จ
+  'queryStoreOrderSettledInfo'          // รายละเอียดบิล (สินค้าในบิล + ส่วนลดต่อบรรทัด) → นับแก้วฟรี
 ];
 
 const captures = {};  // serviceName -> { request:{headers,body}, response:<json> }
@@ -145,6 +147,19 @@ async function main() {
       await page.waitForTimeout(1500);
     } catch (e) { log('  (คลิกแท็บแจ้งเตือนสต็อกไม่ได้: ' + e.message + ')'); }
 
+    // หน้าสรุปยอดขายตามใบเสร็จ → ดักแม่แบบ request ของรายการบิล + รายละเอียดบิล (ใช้ตอนเขียน NerdDoc 2027)
+    if (process.env.WRITE_SHEET === '1') {
+      log('เปิดหน้าสรุปยอดขายตามใบเสร็จ…');
+      await page.goto(WEB + '/branch/reports_sales_statistics', { waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
+      await page.waitForTimeout(2500);
+      try {
+        const waitDet = page.waitForResponse(r => r.url().includes('queryStoreOrderSettledInfo'), { timeout: 15000 }).catch(() => null);
+        await page.getByText('รายละเอียด', { exact: true }).first().click({ timeout: 8000 });
+        await waitDet;
+        await page.keyboard.press('Escape').catch(() => {});
+      } catch (e) { log('  (เปิดรายละเอียดบิลไม่ได้: ' + e.message + ')'); }
+    }
+
     log('เปิดหน้าสรุปยอดขายทั้งหมด…');
     await page.goto(WEB + '/branch/reports_business_overview', { waitUntil: 'networkidle', timeout: 60000 });
     await page.waitForTimeout(2500);
@@ -176,6 +191,13 @@ async function main() {
     // (server ไม่รับ filter สต็อกต่ำ — คืนทุกอย่างมาอยู่ดี)
     await replay('queryInvSpuListManage', { storeId: STORE, pageNum: 1, pageSize: 500 });
 
+    // ---------- 3.5) บิลของวันนี้ + รายละเอียดบิลที่มีส่วนลด (NerdDoc 2027) ----------
+    let nerd27 = null;
+    if (process.env.WRITE_SHEET === '1') {
+      try { nerd27 = await collectNerd27(ctx, range); }
+      catch (e) { log('เก็บข้อมูล NerdDoc 2027 ไม่ได้:', e.message); }
+    }
+
     // ---------- 4) DUMP ข้อมูลดิบให้เห็นโครงสร้างจริง ----------
     const dump = {};
     for (const s of SERVICES) {
@@ -188,6 +210,7 @@ async function main() {
         lowStock:      c.lowStock
       };
     }
+    dump.nerd27 = nerd27;
     fs.writeFileSync('gpos_raw.json', JSON.stringify(dump, null, 2));
     // สรุปสั้น ๆ ว่าแต่ละ service ดักได้ไหม (พิมพ์ก่อน JSON ก้อนใหญ่ กันโดนตัด)
     console.log('\n==================== CAPTURED SUMMARY ====================');
@@ -213,6 +236,7 @@ async function main() {
     // ---------- 6) เขียนจำนวนสินค้าลง NerdDoc — เฉพาะรอบเปิดร้าน (WRITE_SHEET=1, ทุก 30 นาที 07:30–15:30) ----------
     if (process.env.WRITE_SHEET === '1') {
       await pushNerdFill(captures, range);
+      if (nerd27) await pushNerd27(nerd27);
     } else {
       log('ข้ามเขียน NerdDoc (WRITE_SHEET != 1)');
     }
@@ -388,6 +412,119 @@ async function pushNerdFill(cap, range) {
     const t = await r.text().catch(() => '');
     log('เขียน NerdDoc:', r.status, '| date', date, '| qty', JSON.stringify(q), '| resp', String(t).slice(0, 120));
   } catch (e) { log('เขียน NerdDoc ไม่ได้:', e.message); }
+}
+
+/* ======================= NerdDoc 2027 (ขั้น 2) ======================= */
+
+// แก้ค่าใน body ของ request แม่แบบ (เดินทุกชั้น): ช่วงเวลา / หน้า / storeId / orderId
+function patchBody(obj, f) {
+  if (!obj || typeof obj !== 'object') return;
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (v && typeof v === 'object' && !Array.isArray(v)) patchBody(v, f);
+    else { const nv = f(k, v); if (nv !== undefined) obj[k] = nv; }
+  }
+}
+
+// ยิง service ซ้ำด้วย headers + envelope จริงที่ดักได้ (มี token ครบ) แล้วแก้ค่าใน body ตาม patcher
+async function replayWith(ctx, svc, patcher) {
+  const cap = captures[svc];
+  if (!cap || !cap.request || !cap.request.body) throw new Error('ไม่มีแม่แบบ request ของ ' + svc);
+  const env = JSON.parse(JSON.stringify(cap.request.body));
+  patchBody(env.httpData && env.httpData.body ? env.httpData.body : env, patcher);
+  const resp = await ctx.request.post('https://api-th1.biot-apps.com/?serviceName=' + svc, { headers: cap.request.headers, data: env });
+  return await resp.json();
+}
+
+const amt = x => Number(x && typeof x === 'object' ? x.amount : x || 0) / 1000;   // GPOS เก็บเงินเป็น 1/1000 บาท
+const r2  = n => Math.round(n * 100) / 100;
+
+async function collectNerd27(ctx, range) {
+  // 1) รายการบิลทั้งหมดของวัน (แบ่งหน้า)
+  const bills = [];
+  for (let pg = 1; pg <= 10; pg++) {
+    const j = await replayWith(ctx, 'queryStoreSalesSettledDetailReport', (k, v) => {
+      const isT = typeof v === 'number' || /^\d{12,}$/.test(String(v));   // epoch ms (ตัวเลขหรือข้อความ)
+      if (/^(start|begin)/i.test(k) && isT) return typeof v === 'number' ? range.startTime : String(range.startTime);
+      if (/^end/i.test(k) && isT) return typeof v === 'number' ? range.endTime : String(range.endTime);
+      if (/pageSize/i.test(k)) return 200;
+      if (/pageNum|^current$|^page$/i.test(k)) return pg;
+      if (k === 'storeId') return STORE;
+    });
+    const list = (j && j.data && (j.data.list || j.data.records)) || [];
+    bills.push(...list);
+    if (list.length < 200) break;
+  }
+  log('NerdDoc 2027: บิลวันนี้', bills.length, 'ใบ');
+
+  // 2) เงินแยกวิธีชำระ (จาก payMethodInfo ของแต่ละบิล)
+  const money = { cash: 0, pp: 0, tr: 0, grab: 0, other: 0, grabN: 0 };
+  bills.forEach(b => {
+    if (String(b.platform || '').toUpperCase().includes('GRAB')) money.grabN++;
+    const pays = (b.payMethodInfo && b.payMethodInfo.length) ? b.payMethodInfo : [{ payMethodName: b.payMethodName, amount: b.realAmount || b.amount }];
+    pays.forEach(p => {
+      const n = String(p.payMethodName || '').toLowerCase(), a = amt(p.amount);
+      if (n.includes('cash') || n.includes('เงินสด')) money.cash += a;
+      else if (n.includes('promptpay') || n.includes('พร้อมเพย์')) money.pp += a;
+      else if (n.includes('โอน')) money.tr += a;
+      else if (n.includes('grab')) money.grab += a;
+      else money.other += a;
+    });
+  });
+  Object.keys(money).forEach(k => { if (k !== 'grabN') money[k] = r2(money[k]); });
+
+  // 3) แก้วฟรี = บรรทัดสินค้าที่ลดเต็มราคา (ดูเฉพาะบิลที่มีส่วนลด) — นับจำนวนแก้วที่ส่วนลด = ราคาเต็มพอดี
+  let free = 0; const freeItems = [];
+  const discBills = bills.filter(b => amt(b.discountAmount) > 0);
+  for (const b of discBills) {
+    try {
+      const j = await replayWith(ctx, 'queryStoreOrderSettledInfo', (k) => { if (/orderId/i.test(k)) return b.orderId; });
+      const lines = (j && j.data && j.data.orderDetail) || [];
+      lines.forEach(l => {
+        if (l.isRefund) return;
+        const unit = amt(l.price), disc = amt(l.discountAmount), q = Number(l.quantity || 0);
+        if (unit > 0 && disc > 0 && Math.abs(disc / unit - Math.round(disc / unit)) < 1e-6) {
+          const n = Math.min(q, Math.round(disc / unit));
+          if (n > 0) { free += n; freeItems.push((l.orderDetailName || l.spuName) + ' ×' + n); }
+        }
+      });
+    } catch (e) { log('  อ่านรายละเอียดบิล ' + b.orderId + ' ไม่ได้:', e.message); }
+  }
+
+  // 4) จำนวนแก้ว/อาหาร + ยอดรายเมนู จาก querySalesItemReport (รายงานรายสินค้าของวันนี้)
+  const sales = captures.querySalesItemReport && captures.querySalesItemReport.todayResponse;
+  const list = (sales && sales.data && (sales.data.list || sales.data.salesReportModelList)) || [];
+  const c = { cold: 0, hot: 0, cake: 0, sandwich: 0, toast: 0, wrap: 0, salad: 0 };
+  const menu = [];
+  list.forEach(it => {
+    const nm = String(it.itemTitle || ''), q = Number(it.sales || 0);
+    if (/ร้อน/.test(nm)) c.hot += q;
+    else if (/เย็น|ปั่น|โซดา|สมูทตี้|สมูตตี้/.test(nm)) c.cold += q;
+    else if (/แซนวิช|sandwich/i.test(nm)) c.sandwich += q;
+    else if (/โทส|toast/i.test(nm)) c.toast += q;
+    else if (/แรป|wrap/i.test(nm)) c.wrap += q;
+    else if (/สลัด|salad/i.test(nm)) c.salad += q;
+    else if (/เค้ก|cake|บราวนี่|brownie/i.test(nm)) c.cake += q;
+    const pf = String(it.platform || '').toUpperCase();
+    menu.push({ ch: pf.includes('GRAB') ? 'Grab' : (pf === 'POS' || !pf ? 'หน้าร้าน' : pf), name: nm, qty: q, amt: r2(amt(it.salesPrice)) });
+  });
+
+  const date = new Date(range.startTime + TZ_OFFSET_MS).toISOString().slice(0, 10);
+  const out = { date, gpos: Object.assign({}, money, c, { free }), menu, freeItems, bills: bills.length };
+  log('NerdDoc 2027:', JSON.stringify(out.gpos), '| ฟรี:', freeItems.join(', ') || '-');
+  return out;
+}
+
+async function pushNerd27(d) {
+  if (!LEDGER_URL || !LEDGER_TOKEN) { log('ข้าม NerdDoc 2027 — ยังไม่ตั้ง LEDGER_URL / LEDGER_TOKEN'); return; }
+  try {
+    const r = await fetch(LEDGER_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, redirect: 'follow',
+      body: JSON.stringify({ token: LEDGER_TOKEN, type: 'nerd27', date: d.date, gpos: d.gpos, menu: d.menu })
+    });
+    const t = await r.text().catch(() => '');
+    log('เขียน NerdDoc 2027:', r.status, '| resp', String(t).slice(0, 160));
+  } catch (e) { log('เขียน NerdDoc 2027 ไม่ได้:', e.message); }
 }
 
 /** ส่งข้อความเข้า LINE ผ่าน Messaging API (push ทีละผู้รับ) */
