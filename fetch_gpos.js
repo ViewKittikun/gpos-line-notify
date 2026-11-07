@@ -529,20 +529,34 @@ async function collectNerd27(ctx, range) {
   });
   Object.keys(money).forEach(k => { if (k !== 'grabN') money[k] = r2(money[k]); });
 
-  // 3) แก้วฟรี = บรรทัดสินค้าที่ลดเต็มราคา (ดูเฉพาะบิลที่มีส่วนลด) — นับจำนวนแก้วที่ส่วนลด = ราคาเต็มพอดี
+  // 3) แก้วฟรี (เฉพาะบิลหน้าร้าน) — เปิดดูทุกบิลที่จ่ายจริงน้อยกว่าราคาเต็ม (ส่วนลด/คูปอง/โปร) แล้วนับบรรทัดที่
+  //    (ก) จ่ายจริงเป็น 0 ทั้งที่ราคาเต็ม > 0  หรือ  (ข) ส่วนลด = ราคาเต็มพอดี (เป็นจำนวนเต็มแก้ว)
   let free = 0; const freeItems = [];
-  const discBills = bills.filter(b => amt(b.discountAmount) > 0);
+  const DBG = !!process.env.BACKFILL_FROM || process.env.DEBUG_FREE === '1';
+  const pick = o => { const x = {}; Object.keys(o || {}).forEach(k => { const v = o[k];
+    if (/amount|disc|coupon|promo|voucher|price|real|pay|free|gift/i.test(k) && (typeof v === 'number' || (typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v))) && Number(v) !== 0) x[k] = v; }); return x; };
+  const promoKeys = b => Object.keys(b).some(k => /coupon|promo|voucher|gift/i.test(k) && Number(b[k]) > 0);
+  const discBills = bills.filter(b => {
+    const pays = (b.payMethodInfo || []).map(p => p.payMethodName).join(' ');
+    if (/grab/i.test(String(b.platform || '') + ' ' + String(b.subPlatform || '') + ' ' + pays)) return false;
+    const paid = (b.payMethodInfo && b.payMethodInfo.length) ? b.payMethodInfo.reduce((t, p) => t + amt(p.amount), 0) : amt(b.realAmount);
+    return amt(b.discountAmount) > 0 || amt(b.realAmount) < amt(b.amount) - 0.009 || paid < amt(b.amount) - 0.009 || promoKeys(b);
+  });
   for (const b of discBills) {
     try {
       const j = await replayWith(ctx, 'queryStoreOrderSettledInfo', (k) => { if (/orderId/i.test(k)) return b.orderId; });
       const lines = (j && j.data && j.data.orderDetail) || [];
+      if (DBG) log('  [ตรวจแก้วฟรี] บิล', b.orderId, JSON.stringify(pick(b)), '| ระดับบิล(detail):', JSON.stringify(pick(j && j.data)));
       lines.forEach(l => {
         if (l.isRefund) return;
         const unit = amt(l.price), disc = amt(l.discountAmount), q = Number(l.quantity || 0);
-        if (unit > 0 && disc > 0 && Math.abs(disc / unit - Math.round(disc / unit)) < 1e-6) {
-          const n = Math.min(q, Math.round(disc / unit));
-          if (n > 0) { free += n; freeItems.push((l.orderDetailName || l.spuName) + ' ×' + n); }
-        }
+        const hasActual = l.actualAmount !== undefined && l.actualAmount !== null && l.actualAmount !== '';
+        const actual = hasActual ? amt(l.actualAmount) : null;
+        let n = 0;
+        if (unit > 0 && hasActual && actual <= 0.009) n = q;                                                      // (ก) ราคาเป็น 0 / คูปองหักเต็ม
+        else if (unit > 0 && disc > 0 && Math.abs(disc / unit - Math.round(disc / unit)) < 1e-6) n = Math.min(q, Math.round(disc / unit));   // (ข)
+        if (DBG) log('    - ' + (l.orderDetailName || l.spuName) + ' ' + (l.skuName || '') + ' ×' + q, JSON.stringify(pick(l)), n ? '→ ฟรี ' + n : '');
+        if (n > 0) { free += n; freeItems.push((l.orderDetailName || l.spuName) + ' ×' + n); }
       });
     } catch (e) { log('  อ่านรายละเอียดบิล ' + b.orderId + ' ไม่ได้:', e.message); }
   }
