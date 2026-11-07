@@ -486,6 +486,7 @@ async function replayWith(ctx, svc, patcher) {
 
 const amt = x => Number(x && typeof x === 'object' ? x.amount : x || 0) / 1000;   // GPOS เก็บเงินเป็น 1/1000 บาท
 const r2  = n => Math.round(n * 100) / 100;
+const LMS_RE = /line\s*man|lineman|shopee|ไลน์แมน|ช้อปปี้/i;
 
 async function collectNerd27(ctx, range) {
   // 1) รายการบิลทั้งหมดของวัน (แบ่งหน้า)
@@ -506,9 +507,14 @@ async function collectNerd27(ctx, range) {
   log('NerdDoc 2027: บิลวันนี้', bills.length, 'ใบ');
 
   // 2) เงินแยกวิธีชำระ (จาก payMethodInfo ของแต่ละบิล)
-  const money = { cash: 0, pp: 0, tr: 0, grab: 0, other: 0, grabN: 0 };
+  const money = { cash: 0, pp: 0, tr: 0, grab: 0, other: 0, grabN: 0, lms: 0, lmsN: 0 };
+  const lmsBills = [];
   bills.forEach(b => {
     const pays = (b.payMethodInfo && b.payMethodInfo.length) ? b.payMethodInfo : [{ payMethodName: b.payMethodName, amount: b.realAmount || b.amount }];
+    // LINE MAN / Shopee: กดจ่ายด้วยปุ่ม "LINE MAN · Shopee" ใน GPOS (เริ่ม 5 พ.ย. 2026) ราคาเป็นราคาในแอป
+    if (pays.some(p => LMS_RE.test(String(p.payMethodName || '')))) {
+      money.lmsN++; money.lms += pays.reduce((s, p) => s + amt(p.amount), 0); lmsBills.push(b); return;
+    }
     const isGrab = /grab/i.test(String(b.platform || '') + ' ' + String(b.subPlatform || '') + ' ' + pays.map(p => p.payMethodName).join(' '));
     if (isGrab) {
       // Grab: ใช้ยอดขายที่ไม่รวมค่าจัดส่ง ให้ตรงกับ Grab Merchant (GPOS บวกค่าจัดส่งเล็กน้อยไว้ในบางบิล)
@@ -527,7 +533,7 @@ async function collectNerd27(ctx, range) {
       else money.other += a;
     });
   });
-  Object.keys(money).forEach(k => { if (k !== 'grabN') money[k] = r2(money[k]); });
+  Object.keys(money).forEach(k => { if (k !== 'grabN' && k !== 'lmsN') money[k] = r2(money[k]); });
 
   // 3) แก้วฟรี (เฉพาะบิลหน้าร้าน) — เปิดดูทุกบิลที่จ่ายจริงน้อยกว่าราคาเต็ม (ส่วนลด/คูปอง/โปร) แล้วนับบรรทัดที่
   //    (ก) จ่ายจริงเป็น 0 ทั้งที่ราคาเต็ม > 0  หรือ  (ข) ส่วนลด = ราคาเต็มพอดี (เป็นจำนวนเต็มแก้ว)
@@ -538,7 +544,7 @@ async function collectNerd27(ctx, range) {
   const promoKeys = b => Object.keys(b).some(k => /coupon|promo|voucher|gift/i.test(k) && Number(b[k]) > 0);
   const discBills = bills.filter(b => {
     const pays = (b.payMethodInfo || []).map(p => p.payMethodName).join(' ');
-    if (/grab/i.test(String(b.platform || '') + ' ' + String(b.subPlatform || '') + ' ' + pays)) return false;
+    if (/grab/i.test(String(b.platform || '') + ' ' + String(b.subPlatform || '') + ' ' + pays) || LMS_RE.test(pays)) return false;
     const paid = (b.payMethodInfo && b.payMethodInfo.length) ? b.payMethodInfo.reduce((t, p) => t + amt(p.amount), 0) : amt(b.realAmount);
     return amt(b.discountAmount) > 0 || amt(b.realAmount) < amt(b.amount) - 0.009 || paid < amt(b.amount) - 0.009 || promoKeys(b);
   });
@@ -578,6 +584,28 @@ async function collectNerd27(ctx, range) {
     const pf = String(it.platform || '').toUpperCase();
     menu.push({ ch: pf.includes('GRAB') ? 'Grab' : (pf === 'POS' || !pf ? 'หน้าร้าน' : pf), name: nm, qty: q, amt: r2(amt(it.salesPrice)) });
   });
+  // ย้ายเมนูของบิล LINE MAN/Shopee ออกจาก "หน้าร้าน" ไปเป็นช่องทางของตัวเอง (รายงานรายสินค้าของ GPOS รวมไว้เป็น POS)
+  if (lmsBills.length) {
+    const lm = {};
+    for (const b of lmsBills) {
+      try {
+        const j = await replayWith(ctx, 'queryStoreOrderSettledInfo', (k) => { if (/orderId/i.test(k)) return b.orderId; });
+        ((j && j.data && j.data.orderDetail) || []).forEach(l => {
+          if (l.isRefund) return;
+          const nm = String(l.orderDetailName || l.spuName || ''), q = Number(l.quantity || 0);
+          const a = (l.actualAmount !== undefined && l.actualAmount !== null && l.actualAmount !== '') ? amt(l.actualAmount) : amt(l.price) * q;
+          if (!lm[nm]) lm[nm] = { qty: 0, amt: 0 }; lm[nm].qty += q; lm[nm].amt += a;
+        });
+      } catch (e) { log('  อ่านบิล LINE MAN/Shopee ' + b.orderId + ' ไม่ได้:', e.message); }
+    }
+    Object.keys(lm).forEach(nm => {
+      const st = menu.find(m => m.ch === 'หน้าร้าน' && m.name === nm);
+      if (st) { const ratio = st.qty ? Math.min(1, lm[nm].qty / st.qty) : 0; st.amt = r2(st.amt * (1 - ratio)); st.qty = Math.max(0, st.qty - lm[nm].qty); }
+      menu.push({ ch: 'LINE MAN/Shopee', name: nm, qty: lm[nm].qty, amt: r2(lm[nm].amt) });
+    });
+    for (let i = menu.length - 1; i >= 0; i--) if (!menu[i].qty) menu.splice(i, 1);
+    log('NerdDoc 2027: LINE MAN/Shopee ใน GPOS', lmsBills.length, 'บิล =', r2(money.lms), '·', Object.keys(lm).map(n => n + ' ×' + lm[n].qty).join(', '));
+  }
 
   // 5) รายชื่อเมนูทั้งหมดใน GPOS (ไว้หาเมนูที่ไม่เคยขาย) — จากรายการสินค้า ไม่เอาวัตถุดิบ (METERIAL)
   const invC = [captures.queryInvSpuListManage && captures.queryInvSpuListManage.todayResponse,
@@ -661,7 +689,8 @@ async function buildMessage27(ctx, cap, range, n27) {
   const sum = await fetchSummary27(date);
   const sv = (sum && sum.saved) || null;
   const lm = sv ? N(sv.lmSale) || 0 : 0, sp = sv ? N(sv.spSale) || 0 : 0;
-  const total = gposTotal + lm + sp;
+  const gLms = Number(g.lms || 0);                               // ออเดอร์ LINE MAN/Shopee ที่อยู่ใน GPOS แล้ว (เริ่ม 5 พ.ย. 2026)
+  const total = gLms > 0 ? gposTotal : gposTotal + lm + sp;      // มีใน GPOS แล้ว → ไม่บวกยอดที่น้องกรอกซ้ำ
 
   // เรื่องที่ต้องดู (รวมไว้บล็อกเดียวด้านบน)
   const alerts = [];
@@ -675,6 +704,8 @@ async function buildMessage27(ctx, cap, range, n27) {
     };
     diff('เงินสด', N(sv.cashCount), n27 ? g.cash : null);
     diff('เงินโอน', N(sv.trReal) === null ? null : N(sv.trReal) - (N(sv.grabTP) || 0), n27 ? (g.pp || 0) + (g.tr || 0) : null);
+    if (gLms > 0 && Math.abs(gLms - (lm + sp)) >= 1)
+      alerts.push('LINE MAN/Shopee ใน GPOS ' + B(gLms) + ' ≠ น้องกรอก ' + B(lm + sp));
   } else alerts.push('ยังไม่ปิดยอด');
 
   const oos = (sum && sum.oos) || [];
@@ -703,7 +734,8 @@ async function buildMessage27(ctx, cap, range, n27) {
   L.push(LINE);
   const sub = [];
   if (n27) sub.push(n27.bills + ' บิล');
-  if (lm || sp) sub.push('GPOS ' + B(gposTotal) + ' + LINE MAN/Shopee ' + B(lm + sp));
+  if (gLms > 0) sub.push('รวม LINE MAN/Shopee ' + B(gLms) + ' (' + (g.lmsN || 0) + ')');
+  else if (lm || sp) sub.push('GPOS ' + B(gposTotal) + ' + LINE MAN/Shopee ' + B(lm + sp));
   if (sub.length) L.push(sub.join(' · '));
   const cmp = [];
   if (sum && sum.goal) cmp.push(total >= sum.goal ? '🎯 ถึงเป้า ฿' + B(sum.goal) : '🎯 ต่ำกว่าเป้า ฿' + B(sum.goal - total));
