@@ -191,6 +191,29 @@ async function main() {
     // (server ไม่รับ filter สต็อกต่ำ — คืนทุกอย่างมาอยู่ดี)
     await replay('queryInvSpuListManage', { storeId: STORE, pageNum: 1, pageSize: 500 });
 
+    // ---------- 3.1) ดึงย้อนหลังทีละวัน (BACKFILL_FROM..BACKFILL_TO) → NerdDoc 2027 แล้วจบ ----------
+    if (process.env.BACKFILL_FROM) {
+      const from = process.env.BACKFILL_FROM, to = process.env.BACKFILL_TO || from;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) throw new Error('BACKFILL_FROM/TO ต้องเป็น YYYY-MM-DD');
+      const rangeFor = d => { const [y, m, dd] = d.split('-').map(Number);
+        return { startTime: Date.UTC(y, m - 1, dd, 0, 0, 0) - TZ_OFFSET_MS, endTime: Date.UTC(y, m - 1, dd, 23, 59, 59) - TZ_OFFSET_MS }; };
+      const next = d => new Date(Date.UTC(...d.split('-').map((v, i) => i === 1 ? Number(v) - 1 : Number(v))) + 864e5).toISOString().slice(0, 10);
+      let done = 0, empty = 0, fail = 0;
+      for (let d = from; d <= to; d = next(d)) {
+        try {
+          const r = rangeFor(d);
+          await replay('querySalesItemReport', { startTime: r.startTime, endTime: r.endTime, storeId: STORE, pageNum: 1, pageSize: 500 });
+          const n = await collectNerd27(ctx, r);
+          if (!n.bills) { empty++; log('ย้อนหลัง ' + d + ': ไม่มีบิลใน GPOS — ข้าม'); continue; }
+          delete n.catalog;                      // ไม่ต้องอัปเดตรายการเมนูทุกวัน
+          await pushNerd27(n); done++;
+          log('ย้อนหลัง ' + d + ': ' + n.bills + ' บิล ✓');
+        } catch (e) { fail++; log('ย้อนหลัง ' + d + ' ไม่สำเร็จ:', e.message); }
+      }
+      log('ดึงย้อนหลังเสร็จ: เขียน ' + done + ' วัน · ไม่มีบิล ' + empty + ' วัน · ไม่สำเร็จ ' + fail + ' วัน');
+      return;
+    }
+
     // ---------- 3.5) บิลของวันนี้ + รายละเอียดบิลที่มีส่วนลด (NerdDoc 2027) ----------
     let nerd27 = null;
     if (process.env.WRITE_SHEET === '1' || process.env.SEND_LINE === '1') {
@@ -640,6 +663,8 @@ async function buildMessage27(ctx, cap, range, n27) {
     diff('เงินโอน', N(sv.trReal) === null ? null : N(sv.trReal) - (N(sv.grabTP) || 0), n27 ? (g.pp || 0) + (g.tr || 0) : null);
   } else alerts.push('ยังไม่ปิดยอด');
 
+  const oos = (sum && sum.oos) || [];
+  if (oos.length) alerts.push('น้องแจ้งของหมด ' + oos.length + ' อย่าง: ' + oos.slice(0, 10).join(', ') + (oos.length > 10 ? ' …+' + (oos.length - 10) : ''));
   const invCand = [cap.queryInvSpuListManage && cap.queryInvSpuListManage.todayResponse, cap.queryInvSpuListManage && cap.queryInvSpuListManage.response]
     .find(a => a && a.success && a.data && (a.data.list || a.data.records));
   let stockOk = false;
